@@ -1265,14 +1265,31 @@ fun FixesTab(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var filter by remember { mutableStateOf("") }
+    var onlyInstalled by remember { mutableStateOf(true) }
+    var installedAppIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var loading by remember { mutableStateOf(false) }
     var listings by remember { mutableStateOf<List<DenuvoGameListing>>(emptyList()) }
     var fixesByApp by remember { mutableStateOf<Map<String, List<DenuvoFix>>>(emptyMap()) }
     var communityFixes by remember { mutableStateOf<List<org.json.JSONObject>>(emptyList()) }
     var statusMsg by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(targetStatus.packageName) {
         loading = true
+        val localIds = luaInstaller.listInstalledLuaGames().map { it.appId.toString() }.toMutableSet()
+        if (targetStatus.mode == ConnectionMode.FULLY_CONNECTED && targetStatus.packageName != null) {
+            TargetAppBridge.getBridgeStatus(context, targetStatus.packageName).onSuccess { jsonStr ->
+                runCatching {
+                    val arr = org.json.JSONObject(jsonStr).optJSONArray("attached")
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val id = arr.getJSONObject(i).optInt("app_id", 0)
+                            if (id > 0) localIds.add(id.toString())
+                        }
+                    }
+                }
+            }
+        }
+        installedAppIds = localIds
         listings = runCatching { apiClient.getDenuvoListingsAsync() }.getOrDefault(emptyList())
         communityFixes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             runCatching {
@@ -1292,10 +1309,12 @@ fun FixesTab(
         loading = false
     }
 
-    val filtered = remember(listings, filter) {
-        if (filter.isBlank()) listings
-        else listings.filter {
-            it.name.contains(filter, ignoreCase = true) || it.appId.contains(filter, ignoreCase = true)
+    val filtered = remember(listings, filter, onlyInstalled, installedAppIds) {
+        listings.filter { game ->
+            (!onlyInstalled || installedAppIds.contains(game.appId)) &&
+                (filter.isBlank() ||
+                    game.name.contains(filter, ignoreCase = true) ||
+                    game.appId.contains(filter, ignoreCase = true))
         }
     }
 
@@ -1307,6 +1326,14 @@ fun FixesTab(
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("Only show installed games (${installedAppIds.size})", style = MaterialTheme.typography.bodySmall)
+            Switch(checked = onlyInstalled, onCheckedChange = { onlyInstalled = it })
+        }
         if (statusMsg != null) {
             Spacer(Modifier.height(6.dp))
             Text(statusMsg!!, style = MaterialTheme.typography.bodySmall, color = Color(0xFF81C784))
@@ -1317,11 +1344,13 @@ fun FixesTab(
             Spacer(Modifier.height(8.dp))
         }
 
-        val filteredCommunity = remember(communityFixes, filter) {
-            if (filter.isBlank()) communityFixes
-            else communityFixes.filter {
-                it.optString("name").contains(filter, ignoreCase = true) ||
-                    it.optString("appId").contains(filter, ignoreCase = true)
+        val filteredCommunity = remember(communityFixes, filter, onlyInstalled, installedAppIds) {
+            communityFixes.filter {
+                val id = it.optString("appId")
+                (!onlyInstalled || installedAppIds.contains(id)) &&
+                    (filter.isBlank() ||
+                        it.optString("name").contains(filter, ignoreCase = true) ||
+                        id.contains(filter, ignoreCase = true))
             }
         }
 
