@@ -1267,6 +1267,7 @@ fun FixesTab(
     var filter by remember { mutableStateOf("") }
     var onlyInstalled by remember { mutableStateOf(true) }
     var installedAppIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var installedFixes by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var loading by remember { mutableStateOf(false) }
     var listings by remember { mutableStateOf<List<DenuvoGameListing>>(emptyList()) }
     var fixesByApp by remember { mutableStateOf<Map<String, List<DenuvoFix>>>(emptyMap()) }
@@ -1277,6 +1278,7 @@ fun FixesTab(
         loading = true
         val localIds = luaInstaller.listInstalledLuaGames().map { it.appId.toString() }.toMutableSet()
         if (targetStatus.mode == ConnectionMode.FULLY_CONNECTED && targetStatus.packageName != null) {
+            installedFixes = TargetAppBridge.getInstalledFixes(context, targetStatus.packageName)
             TargetAppBridge.getBridgeStatus(context, targetStatus.packageName).onSuccess { jsonStr ->
                 runCatching {
                     val arr = org.json.JSONObject(jsonStr).optJSONArray("attached")
@@ -1360,15 +1362,19 @@ fun FixesTab(
                 val gameName = ghFix.optString("name", "AppID $appIdStr")
                 val title = ghFix.optString("title", "Community Fix")
                 val desc = ghFix.optString("description", "")
+                val remoteVer = ghFix.optString("version", "1.0.0")
                 val zipUrl = ghFix.optString("zipUrl", "")
+                val installedVer = installedFixes[appIdStr]
+                val isInstalled = installedVer != null
+                val hasUpdate = isInstalled && installedVer != remoteVer
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("$gameName ($appIdStr) — $title", fontWeight = FontWeight.SemiBold)
                         if (desc.isNotBlank()) Text(desc, style = MaterialTheme.typography.bodySmall)
                         if (zipUrl.isNotBlank()) {
-                            Button(onClick = {
+                            val doApply: () -> Unit = {
                                 scope.launch {
-                                    statusMsg = "Downloading community fix..."
+                                    statusMsg = "Downloading fix..."
                                     val tmp = File(context.cacheDir, "gh_fix_$appIdStr.zip")
                                     val dl = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                                         runCatching {
@@ -1397,9 +1403,13 @@ fun FixesTab(
                                                     pkg = targetStatus.packageName,
                                                     appId = appNum,
                                                     gameName = gameName,
-                                                    fixZipFile = zip
+                                                    fixZipFile = zip,
+                                                    fixVersion = remoteVer
                                                 ).fold(
-                                                    onSuccess = { "$localRes\n$it" },
+                                                    onSuccess = {
+                                                        installedFixes = installedFixes + (appIdStr to remoteVer)
+                                                        "$localRes\n$it"
+                                                    },
                                                     onFailure = { "$localRes\nBridge apply failed: ${it.message}" }
                                                 )
                                             } else localRes
@@ -1407,7 +1417,35 @@ fun FixesTab(
                                         onFailure = { "Error: ${it.message}" }
                                     )
                                 }
-                            }) { Text("Download & Apply Fix") }
+                            }
+
+                            if (!isInstalled) {
+                                Button(onClick = doApply) { Text("Apply") }
+                            } else {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        enabled = hasUpdate,
+                                        onClick = doApply
+                                    ) { Text("Update") }
+                                    OutlinedButton(onClick = {
+                                        scope.launch {
+                                            val appNum = appIdStr.toLongOrNull() ?: 0L
+                                            if (appNum > 0L &&
+                                                targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
+                                                targetStatus.packageName != null
+                                            ) {
+                                                TargetAppBridge.removeFix(context, targetStatus.packageName, appNum).fold(
+                                                    onSuccess = {
+                                                        installedFixes = installedFixes - appIdStr
+                                                        statusMsg = it
+                                                    },
+                                                    onFailure = { statusMsg = "Remove failed: ${it.message}" }
+                                                )
+                                            }
+                                        }
+                                    }) { Text("Remove") }
+                                }
+                            }
                         }
                     }
                 }

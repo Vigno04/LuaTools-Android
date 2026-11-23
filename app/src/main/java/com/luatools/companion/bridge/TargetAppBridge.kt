@@ -210,7 +210,8 @@ object TargetAppBridge {
         pkg: String,
         appId: Long,
         gameName: String,
-        fixZipFile: java.io.File
+        fixZipFile: java.io.File,
+        fixVersion: String = "1.0.0"
     ): Result<String> {
         val bridgeUri = Uri.parse("content://$pkg.bh_lua_bridge")
         val uploadUri = Uri.parse("content://$pkg.bh_lua_bridge/fix_in/$appId")
@@ -223,6 +224,7 @@ object TargetAppBridge {
             val extras = Bundle().apply {
                 putInt("app_id", appId.toInt())
                 putString("name", gameName)
+                putString("fix_version", fixVersion)
             }
             val res = context.contentResolver.call(bridgeUri, "apply_fix", appId.toString(), extras)
                 ?: return Result.failure(IllegalStateException("No response from BannerHub bridge"))
@@ -237,6 +239,45 @@ object TargetAppBridge {
             }
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    fun removeFix(
+        context: Context,
+        pkg: String,
+        appId: Long
+    ): Result<String> {
+        val bridgeUri = Uri.parse("content://$pkg.bh_lua_bridge")
+        return try {
+            val extras = Bundle().apply { putInt("app_id", appId.toInt()) }
+            val res = context.contentResolver.call(bridgeUri, "remove_fix", appId.toString(), extras)
+                ?: return Result.failure(IllegalStateException("No response from bridge"))
+            if (res.getBoolean("ok", false)) {
+                val removed = res.getInt("removed_files", 0)
+                Result.success("Removed fix ($removed file(s) removed)")
+            } else {
+                Result.failure(IllegalStateException(res.getString("error", "remove_fix failed")))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    fun getInstalledFixes(context: Context, pkg: String): Map<String, String> {
+        val bridgeUri = Uri.parse("content://$pkg.bh_lua_bridge")
+        return try {
+            val res = context.contentResolver.call(bridgeUri, "fix_status", null, null) ?: return emptyMap()
+            if (!res.getBoolean("ok", false)) return emptyMap()
+            val obj = org.json.JSONObject(res.getString("installed_json", "{}"))
+            val map = mutableMapOf<String, String>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                map[k] = obj.optString(k, "1.0.0")
+            }
+            map
+        } catch (_: Exception) {
+            emptyMap()
         }
     }
 
