@@ -1268,11 +1268,27 @@ fun FixesTab(
     var loading by remember { mutableStateOf(false) }
     var listings by remember { mutableStateOf<List<DenuvoGameListing>>(emptyList()) }
     var fixesByApp by remember { mutableStateOf<Map<String, List<DenuvoFix>>>(emptyMap()) }
+    var communityFixes by remember { mutableStateOf<List<org.json.JSONObject>>(emptyList()) }
     var statusMsg by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
         loading = true
         listings = runCatching { apiClient.getDenuvoListingsAsync() }.getOrDefault(emptyList())
+        communityFixes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                val client = okhttp3.OkHttpClient()
+                val req = okhttp3.Request.Builder()
+                    .url("https://raw.githubusercontent.com/Vigno04/LuaTools-Fixes/main/fixes.json")
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) emptyList()
+                    else {
+                        val arr = org.json.JSONArray(resp.body?.string() ?: "[]")
+                        (0 until arr.length()).map { arr.getJSONObject(it) }
+                    }
+                }
+            }.getOrDefault(emptyList())
+        }
         loading = false
     }
 
@@ -1301,7 +1317,72 @@ fun FixesTab(
             Spacer(Modifier.height(8.dp))
         }
 
+        val filteredCommunity = remember(communityFixes, filter) {
+            if (filter.isBlank()) communityFixes
+            else communityFixes.filter {
+                it.optString("name").contains(filter, ignoreCase = true) ||
+                    it.optString("appId").contains(filter, ignoreCase = true)
+            }
+        }
+
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(filteredCommunity, key = { "gh_${it.optString("appId")}_${it.optString("title")}" }) { ghFix ->
+                val appIdStr = ghFix.optString("appId")
+                val gameName = ghFix.optString("name", "AppID $appIdStr")
+                val title = ghFix.optString("title", "Community Fix")
+                val desc = ghFix.optString("description", "")
+                val zipUrl = ghFix.optString("zipUrl", "")
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("$gameName ($appIdStr) — $title", fontWeight = FontWeight.SemiBold)
+                        if (desc.isNotBlank()) Text(desc, style = MaterialTheme.typography.bodySmall)
+                        if (zipUrl.isNotBlank()) {
+                            Button(onClick = {
+                                scope.launch {
+                                    statusMsg = "Downloading community fix..."
+                                    val tmp = File(context.cacheDir, "gh_fix_$appIdStr.zip")
+                                    val dl = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                        runCatching {
+                                            val client = okhttp3.OkHttpClient()
+                                            val req = okhttp3.Request.Builder().url(zipUrl).build()
+                                            client.newCall(req).execute().use { resp ->
+                                                if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                                                resp.body!!.byteStream().use { ins ->
+                                                    tmp.outputStream().use { os -> ins.copyTo(os) }
+                                                }
+                                            }
+                                            tmp
+                                        }
+                                    }
+                                    statusMsg = dl.fold(
+                                        onSuccess = { zip ->
+                                            val localRes = luaInstaller.extractFixZip(zip, appIdStr)
+                                                .getOrElse { "Extract error: ${it.message}" }
+                                            val appNum = appIdStr.toLongOrNull() ?: 0L
+                                            if (appNum > 0L &&
+                                                targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
+                                                targetStatus.packageName != null
+                                            ) {
+                                                TargetAppBridge.applyFix(
+                                                    context = context,
+                                                    pkg = targetStatus.packageName,
+                                                    appId = appNum,
+                                                    gameName = gameName,
+                                                    fixZipFile = zip
+                                                ).fold(
+                                                    onSuccess = { "$localRes\n$it" },
+                                                    onFailure = { "$localRes\nBridge apply failed: ${it.message}" }
+                                                )
+                                            } else localRes
+                                        },
+                                        onFailure = { "Error: ${it.message}" }
+                                    )
+                                }
+                            }) { Text("Download & Apply Fix") }
+                        }
+                    }
+                }
+            }
             items(filtered, key = { it.appId }) { game ->
                 val fixes = fixesByApp[game.appId]
                 Card(Modifier.fillMaxWidth()) {
