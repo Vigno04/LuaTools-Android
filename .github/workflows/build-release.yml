@@ -1,0 +1,127 @@
+name: Build and Release LuaTools Android APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Platform 36 & Build-Tools 35.0.0
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Determine Tag & Version
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9] ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ github.event.inputs.version }}"
+            if [ -z "$TAG" ]; then TAG="v0.1.0"; fi
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Release & Debug APKs
+        run: ./gradlew assembleRelease assembleDebug --no-daemon
+
+      - name: Sign Release APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+        run: |
+          mkdir -p dist
+          UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          SIGNED_APK="dist/LuaTools-Android-${{ steps.meta.outputs.tag }}.apk"
+          APKSIGNER="${ANDROID_HOME}/build-tools/35.0.0/apksigner"
+          ZIPALIGN="${ANDROID_HOME}/build-tools/35.0.0/zipalign"
+
+          ALIGNED_APK="dist/app-release-aligned.apk"
+          "${ZIPALIGN}" -f -p 4 "${UNSIGNED_APK}" "${ALIGNED_APK}"
+
+          if [ -n "${ANDROID_KEYSTORE_BASE64}" ]; then
+            echo "${ANDROID_KEYSTORE_BASE64}" | base64 -d > release.jks
+            "${APKSIGNER}" sign \
+              --ks release.jks \
+              --ks-pass "pass:${ANDROID_KEYSTORE_PASS}" \
+              --ks-key-alias "${ANDROID_KEY_ALIAS}" \
+              --key-pass "pass:${ANDROID_KEY_PASS}" \
+              --out "${SIGNED_APK}" \
+              "${ALIGNED_APK}"
+            rm -f release.jks
+          else
+            # Fallback ad-hoc signing key so the release APK is directly installable
+            keytool -genkeypair -v \
+              -keystore adhoc.jks \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=LuaTools Android,O=LuaTools,C=US"
+            "${APKSIGNER}" sign \
+              --ks adhoc.jks \
+              --ks-pass pass:android \
+              --ks-key-alias androiddebugkey \
+              --key-pass pass:android \
+              --out "${SIGNED_APK}" \
+              "${ALIGNED_APK}"
+            rm -f adhoc.jks
+          fi
+
+          rm -f "${ALIGNED_APK}"
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/LuaTools-Android-${{ steps.meta.outputs.tag }}-debug.apk"
+          cd dist
+          sha256sum *.apk > SHA256SUMS.txt
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: luatools-android-apks
+          path: dist/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: LuaTools Android ${{ steps.meta.outputs.tag }}
+          body: |
+            ## LuaTools Android ${{ steps.meta.outputs.tag }}
+
+            Android companion app for **LuaTools** & **CloudRedirect** (compatible with **BannerHub** and **GameNative**).
+
+            ### Included files:
+            - `LuaTools-Android-${{ steps.meta.outputs.tag }}.apk`: Signed release APK (recommended).
+            - `LuaTools-Android-${{ steps.meta.outputs.tag }}-debug.apk`: Debug APK.
+            - `SHA256SUMS.txt`: SHA-256 checksums.
+          files: |
+            dist/*

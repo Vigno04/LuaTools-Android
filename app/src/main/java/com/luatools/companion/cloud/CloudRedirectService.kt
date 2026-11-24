@@ -4,6 +4,8 @@ import android.content.Context
 import com.cloudredirect.nativecore.CloudRedirectNative
 import com.cloudredirect.nativecore.OkHttpCloudRedirectBridge
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
@@ -12,8 +14,11 @@ import org.json.JSONObject
  */
 class CloudRedirectService(private val context: Context) {
 
-    @Volatile
-    private var initialized = false
+    companion object {
+        @Volatile
+        private var initialized = false
+        private val nativeMutex = Mutex()
+    }
 
     val isNativeAvailable: Boolean
         get() = CloudRedirectNative.isLoaded
@@ -63,20 +68,22 @@ class CloudRedirectService(private val context: Context) {
         runCmd("discover-cloud-games", provider)
 
     private suspend fun runCmd(command: String, vararg args: String): JSONObject =
-        withContext(Dispatchers.IO) {
-            if (!ensureInitialized()) {
-                return@withContext JSONObject().apply {
-                    put("success", false)
-                    put("error", "libcloud_redirect_android.so not loaded (place in app/src/main/jniLibs)")
+        nativeMutex.withLock {
+            withContext(Dispatchers.IO) {
+                if (!ensureInitialized()) {
+                    return@withContext JSONObject().apply {
+                        put("success", false)
+                        put("error", "libcloud_redirect_android.so not loaded (place in app/src/main/jniLibs)")
+                    }
                 }
-            }
-            val raw = CloudRedirectNative.nativeRunCommand(command, arrayOf(*args))
-            try {
-                JSONObject(raw)
-            } catch (_: Exception) {
-                JSONObject().apply {
-                    put("success", false)
-                    put("raw", raw)
+                val raw = CloudRedirectNative.nativeRunCommand(command, arrayOf(*args))
+                try {
+                    JSONObject(raw)
+                } catch (_: Exception) {
+                    JSONObject().apply {
+                        put("success", false)
+                        put("raw", raw)
+                    }
                 }
             }
         }

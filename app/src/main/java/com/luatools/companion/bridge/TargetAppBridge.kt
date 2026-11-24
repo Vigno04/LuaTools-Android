@@ -160,6 +160,20 @@ object TargetAppBridge {
         }
     }
 
+    fun listLuaApps(context: Context, pkg: String): Set<Long>? {
+        val bridgeUri = Uri.parse("content://$pkg.bh_lua_bridge")
+        return try {
+            val res = context.contentResolver.call(bridgeUri, "list_lua_games", null, null)
+            if (res != null && res.getBoolean("ok", false)) {
+                res.getIntegerArrayList("app_ids")?.map { it.toLong() }?.toSet() ?: emptySet()
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun pushLuaGame(
         context: Context,
         pkg: String,
@@ -194,8 +208,9 @@ object TargetAppBridge {
             val res = context.contentResolver.call(bridgeUri, "add_steam_game", appId.toString(), extras)
                 ?: return Result.failure(IllegalStateException("No response from BannerHub bridge"))
             if (res.getBoolean("ok", false)) {
+                com.luatools.companion.SettingsStore(context).addAppSyncedId(pkg, appId)
                 val manifestsCached = res.getInt("manifests_cached", 0)
-                val path = res.getString("path", "Sent to BannerHub")
+                val path = res.getString("path", "Sent to $pkg")
                 Result.success("$path (manifests cached: $manifestsCached)")
             } else {
                 Result.failure(IllegalStateException(res.getString("error", "BannerHub bridge error")))

@@ -36,8 +36,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import coil.Coil
+import coil.ImageLoader
 import coil.compose.AsyncImage
+import coil.disk.DiskCache
+import coil.memory.MemoryCache
+import coil.request.CachePolicy
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -71,6 +78,24 @@ private enum class AppStage {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Coil.setImageLoader(
+            ImageLoader.Builder(this)
+                .memoryCache {
+                    MemoryCache.Builder(this)
+                        .maxSizePercent(0.25)
+                        .build()
+                }
+                .diskCache {
+                    DiskCache.Builder()
+                        .directory(File(cacheDir, "image_cache"))
+                        .maxSizeBytes(50L * 1024L * 1024L)
+                        .build()
+                }
+                .memoryCachePolicy(CachePolicy.ENABLED)
+                .diskCachePolicy(CachePolicy.ENABLED)
+                .respectCacheHeaders(false)
+                .build()
+        )
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 LuaToolsAndroidRoot()
@@ -183,8 +208,22 @@ fun LuaToolsAndroidRoot() {
             cloudService = cloudService,
             cloudOAuth = cloudOAuth,
             targetStatus = targetStatus,
+            installedApps = installedBannerHubs,
             safUri = safTreeUri,
             safValidation = safValidation,
+            onSelectTarget = { pkg ->
+                settings.selectedPackageName = pkg
+                val plat = when (pkg) {
+                    "app.gamenative" -> TargetPlatform.WINNATIVE
+                    "gamehub.lite" -> TargetPlatform.GAMEHUB
+                    "com.winlator" -> TargetPlatform.WINLATOR
+                    else -> TargetPlatform.BANNERHUB
+                }
+                selectedPlatform = plat
+                settings.selectedPlatform = plat
+                settings.addPlatform(plat.id)
+                refreshTargetStatus()
+            },
             onRefreshBridge = { refreshTargetStatus() },
             onGrantSaf = { safLauncher.launch(buildBannerHubInitialUri(targetStatus)) },
             onClearSaf = {
@@ -528,8 +567,10 @@ fun MainLuaToolsGui(
     cloudService: CloudRedirectService,
     cloudOAuth: CloudRedirectOAuthService,
     targetStatus: TargetAppStatus,
+    installedApps: List<TargetAppStatus>,
     safUri: Uri?,
     safValidation: SafValidationResult?,
+    onSelectTarget: (String) -> Unit,
     onRefreshBridge: () -> Unit,
     onGrantSaf: () -> Unit,
     onClearSaf: () -> Unit,
@@ -589,23 +630,22 @@ fun MainLuaToolsGui(
                 .padding(padding)
                 .padding(horizontal = 16.dp)
         ) {
-            ConnectionStatusCard(status = targetStatus, safUri = safUri, onGrantSaf = onGrantSaf)
-            Spacer(Modifier.height(12.dp))
-
             when (selectedTab) {
                 0 -> HomeTab(
                     settings = settings,
                     targetStatus = targetStatus,
-                    authService = authService,
-                    apiClient = apiClient,
+                    installedApps = installedApps,
                     luaInstaller = luaInstaller,
-                    cloudService = cloudService,
+                    apiClient = apiClient,
                     safUri = safUri,
+                    onSelectTarget = onSelectTarget,
+                    onGrantSaf = onGrantSaf,
                     onGoToAdd = { selectedTab = 1 }
                 )
                 1 -> AddGamesTab(
                     settings = settings,
                     targetStatus = targetStatus,
+                    installedApps = installedApps,
                     apiClient = apiClient,
                     hubcapService = hubcapService,
                     luaInstaller = luaInstaller,
@@ -623,11 +663,14 @@ fun MainLuaToolsGui(
                 )
                 4 -> MergedOptionsTab(
                     settings = settings,
+                    authService = authService,
                     targetStatus = targetStatus,
+                    installedApps = installedApps,
                     safUri = safUri,
                     safValidation = safValidation,
                     hubcapService = hubcapService,
-                    cloudService = cloudService,
+                    luaInstaller = luaInstaller,
+                    onSelectTarget = onSelectTarget,
                     onRefreshBridge = onRefreshBridge,
                     onGrantSaf = onGrantSaf,
                     onClearSaf = onClearSaf,
@@ -684,30 +727,77 @@ fun ConnectionStatusCard(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeTab(
     settings: SettingsStore,
     targetStatus: TargetAppStatus,
-    authService: AuthService,
-    apiClient: LuaToolsApiClient,
+    installedApps: List<TargetAppStatus>,
     luaInstaller: LuaInstaller,
-    cloudService: CloudRedirectService,
+    apiClient: LuaToolsApiClient,
     safUri: Uri?,
+    onSelectTarget: (String) -> Unit,
+    onGrantSaf: () -> Unit,
     onGoToAdd: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var signedIn by remember { mutableStateOf(authService.isSignedIn) }
-    var botCode by remember { mutableStateOf("") }
-    var authStatusMsg by remember { mutableStateOf<String?>(null) }
+    var appDropdownExpanded by remember { mutableStateOf(false) }
     var libraryMsg by remember { mutableStateOf<String?>(null) }
-    var authBusy by remember { mutableStateOf(false) }
     var pushingAppId by remember { mutableStateOf<Long?>(null) }
+    var rePushAllBusy by remember { mutableStateOf(false) }
+    var rePushProgress by remember { mutableFloatStateOf(0f) }
+    var rePushLabel by remember { mutableStateOf("") }
     var updatingAppId by remember { mutableStateOf<Long?>(null) }
     var checkingUpdates by remember { mutableStateOf(false) }
-    var installedGames by remember { mutableStateOf(luaInstaller.listInstalledLuaGames()) }
+    var allCachedGames by remember { mutableStateOf(luaInstaller.listInstalledLuaGames()) }
+    var appInstalledIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
     var updateStatusByApp by remember { mutableStateOf<Map<Long, GameUpdateStatus>>(emptyMap()) }
-    val nativeVer = remember(cloudService.isNativeAvailable) { cloudService.getNativeVersion() }
+
+    val syncAllActive = settings.syncAllConnectedApps
+
+    fun refreshAppGames() {
+        allCachedGames = luaInstaller.listInstalledLuaGames()
+        val targetPkgs = if (syncAllActive) {
+            installedApps.filter { it.mode == ConnectionMode.FULLY_CONNECTED && it.packageName != null }
+                .mapNotNull { it.packageName }
+                .ifEmpty { listOfNotNull(targetStatus.packageName) }
+        } else {
+            listOfNotNull(targetStatus.packageName)
+        }
+        if (targetPkgs.isEmpty()) {
+            appInstalledIds = emptySet()
+            return
+        }
+        val combined = mutableSetOf<Long>()
+        for (pkg in targetPkgs) {
+            combined.addAll(settings.getAppSyncedIds(pkg))
+            if (syncAllActive || targetStatus.mode == ConnectionMode.FULLY_CONNECTED) {
+                TargetAppBridge.listLuaApps(context, pkg)?.let { combined.addAll(it) }
+                TargetAppBridge.getBridgeStatus(context, pkg).onSuccess { jsonStr ->
+                    runCatching {
+                        val arr = org.json.JSONObject(jsonStr).optJSONArray("attached")
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val id = arr.getJSONObject(i).optLong("app_id", 0L)
+                                if (id > 0L) combined.add(id)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        appInstalledIds = combined
+    }
+
+    LaunchedEffect(targetStatus.packageName, targetStatus.mode, syncAllActive) {
+        refreshAppGames()
+    }
+
+    // Only show games that are installed in the currently selected app (or any connected app when synced)
+    val visibleGames = remember(allCachedGames, appInstalledIds) {
+        allCachedGames.filter { appInstalledIds.contains(it.appId) }
+    }
 
     Column(
         modifier = Modifier
@@ -715,89 +805,64 @@ fun HomeTab(
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("LuaTools Account", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                if (signedIn) {
-                    Text(
-                        "Signed in as ${authService.displayName ?: authService.email ?: "LuaTools User"}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF81C784)
-                    )
-                    OutlinedButton(onClick = {
-                        authService.signOut()
-                        signedIn = false
-                        authStatusMsg = "Signed out"
-                    }) {
-                        Text("Sign Out")
-                    }
-                } else {
-                    Text(
-                        "Sign in to download manifests, .lua files, and game fixes.",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            enabled = !authBusy,
-                            onClick = {
-                                scope.launch {
-                                    authBusy = true
-                                    val res = authService.signInWithDiscordPkceAsync()
-                                    signedIn = authService.isSignedIn
-                                    authStatusMsg = res.fold(
-                                        onSuccess = { "Signed in as $it" },
-                                        onFailure = { it.message ?: "Discord login failed" }
-                                    )
-                                    authBusy = false
-                                }
-                            }
-                        ) {
-                            Text("Discord Sign In")
+        // App selector dropdown (grayed out when cross-app sync is active)
+        ExposedDropdownMenuBox(
+            expanded = appDropdownExpanded && !syncAllActive,
+            onExpandedChange = { if (!syncAllActive) appDropdownExpanded = !appDropdownExpanded }
+        ) {
+            val selectedLabel = if (syncAllActive) {
+                "Sync active across all apps"
+            } else {
+                targetStatus.packageName?.let { pkg ->
+                    "${targetStatus.appName} ($pkg)"
+                } ?: "No target app detected"
+            }
+            OutlinedTextField(
+                value = selectedLabel,
+                onValueChange = {},
+                readOnly = true,
+                enabled = !syncAllActive,
+                label = { Text("Active App") },
+                trailingIcon = {
+                    ExposedDropdownMenuDefaults.TrailingIcon(expanded = appDropdownExpanded && !syncAllActive)
+                },
+                modifier = Modifier
+                    .menuAnchor(MenuAnchorType.PrimaryNotEditable)
+                    .fillMaxWidth()
+            )
+            ExposedDropdownMenu(
+                expanded = appDropdownExpanded,
+                onDismissRequest = { appDropdownExpanded = false }
+            ) {
+                installedApps.forEach { app ->
+                    val pkg = app.packageName ?: return@forEach
+                    val badge = if (app.mode == ConnectionMode.FULLY_CONNECTED) "Bridge" else "Fallback"
+                    DropdownMenuItem(
+                        text = { Text("${app.appName} ($pkg) • $badge") },
+                        onClick = {
+                            appDropdownExpanded = false
+                            onSelectTarget(pkg)
                         }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(
-                            value = botCode,
-                            onValueChange = { botCode = it },
-                            label = { Text("6-char /login Bot Code") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        OutlinedButton(
-                            enabled = botCode.trim().length >= 4 && !authBusy,
-                            onClick = {
-                                scope.launch {
-                                    authBusy = true
-                                    val res = authService.signInWithBotCodeAsync(botCode)
-                                    signedIn = authService.isSignedIn
-                                    authStatusMsg = res.fold(
-                                        onSuccess = { "Signed in as $it" },
-                                        onFailure = { it.message ?: "Code sign-in failed" }
-                                    )
-                                    authBusy = false
-                                }
-                            }
-                        ) {
-                            Text("Redeem")
-                        }
-                    }
-                }
-                if (authStatusMsg != null) {
-                    Text(authStatusMsg!!, style = MaterialTheme.typography.bodySmall)
+                    )
                 }
             }
         }
 
+        // Only show connection status card if there is a problem
+        val hasProblem = targetStatus.mode == ConnectionMode.NOT_INSTALLED ||
+            (targetStatus.mode == ConnectionMode.MANUAL_FALLBACK && safUri == null)
+        if (hasProblem) {
+            ConnectionStatusCard(status = targetStatus, safUri = safUri, onGrantSaf = onGrantSaf)
+        }
+
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Installed .lua Library (${installedGames.size})", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "Folder: ${settings.downloadFolder}/stplug-in",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    "${targetStatus.appName} Games (${visibleGames.size})",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
                 )
-                if (installedGames.isNotEmpty()) {
+                if (visibleGames.isNotEmpty()) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             enabled = !checkingUpdates && updatingAppId == null,
@@ -806,7 +871,7 @@ fun HomeTab(
                                     checkingUpdates = true
                                     libraryMsg = "Checking Steam for depot updates (free, 0 quota)..."
                                     val results = mutableMapOf<Long, GameUpdateStatus>()
-                                    for (g in installedGames) {
+                                    for (g in visibleGames) {
                                         results[g.appId] = luaInstaller.checkGameUpdateAsync(g.appId)
                                     }
                                     updateStatusByApp = results
@@ -814,7 +879,7 @@ fun HomeTab(
                                     libraryMsg = if (needUpdate > 0) {
                                         "$needUpdate game(s) have updates or missing manifests."
                                     } else {
-                                        "All ${installedGames.size} game(s) are up to date."
+                                        "All ${visibleGames.size} game(s) are up to date."
                                     }
                                     checkingUpdates = false
                                 }
@@ -824,31 +889,51 @@ fun HomeTab(
                         }
                         if (targetStatus.mode == ConnectionMode.FULLY_CONNECTED && targetStatus.packageName != null) {
                             OutlinedButton(
-                                enabled = pushingAppId == null && !checkingUpdates,
+                                enabled = pushingAppId == null && !checkingUpdates && !rePushAllBusy,
                                 onClick = {
                                     scope.launch {
+                                        val targets = if (syncAllActive) {
+                                            installedApps.filter { it.mode == ConnectionMode.FULLY_CONNECTED && it.packageName != null }
+                                        } else {
+                                            listOf(targetStatus)
+                                        }
+                                        val total = (visibleGames.size * targets.size).coerceAtLeast(1)
+                                        var done = 0
                                         var okCount = 0
+                                        rePushAllBusy = true
+                                        rePushProgress = 0f
                                         val depotCacheDir = File(settings.downloadFolder, "depotcache")
-                                        for (g in installedGames) {
-                                            pushingAppId = g.appId
-                                            val luaFile = File(settings.downloadFolder, "stplug-in/${g.appId}.lua")
-                                            val content = runCatching { luaFile.readText(Charsets.UTF_8) }.getOrDefault("")
-                                            val res = TargetAppBridge.pushLuaGame(
-                                                context = context,
-                                                pkg = targetStatus.packageName,
-                                                appId = g.appId,
-                                                name = g.name,
-                                                luaContent = content,
-                                                depotCacheDir = depotCacheDir
-                                            )
-                                            if (res.isSuccess) okCount++
+                                        for (t in targets) {
+                                            val pkg = t.packageName ?: continue
+                                            for (g in visibleGames) {
+                                                pushingAppId = g.appId
+                                                rePushLabel = "Pushing ${g.name} to ${t.appName} (${done + 1}/$total)..."
+                                                val ok = withContext(Dispatchers.IO) {
+                                                    val luaFile = File(settings.downloadFolder, "stplug-in/${g.appId}.lua")
+                                                    val content = runCatching { luaFile.readText(Charsets.UTF_8) }.getOrDefault("")
+                                                    if (content.isNotBlank()) {
+                                                        TargetAppBridge.pushLuaGame(
+                                                            context = context,
+                                                            pkg = pkg,
+                                                            appId = g.appId,
+                                                            name = g.name,
+                                                            luaContent = content,
+                                                            depotCacheDir = depotCacheDir
+                                                        ).isSuccess
+                                                    } else false
+                                                }
+                                                if (ok) okCount++
+                                                done++
+                                                rePushProgress = done.toFloat() / total.toFloat()
+                                            }
                                         }
                                         pushingAppId = null
-                                        libraryMsg = "Pushed $okCount/${installedGames.size} saved game(s) to BannerHub (0 fetches)."
+                                        rePushAllBusy = false
+                                        libraryMsg = "Re-pushed $okCount/$total push(es)."
                                     }
                                 }
                             ) {
-                                Text("Push All")
+                                Text("Re-push All")
                             }
                         }
                     }
@@ -856,10 +941,14 @@ fun HomeTab(
                 if (libraryMsg != null) {
                     Text(libraryMsg!!, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                 }
-                if (installedGames.isEmpty()) {
-                    Text("No games installed yet.", style = MaterialTheme.typography.bodySmall)
+                if (visibleGames.isEmpty()) {
+                    Text(
+                        "No games installed in ${targetStatus.appName} yet.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 } else {
-                    installedGames.forEach { game ->
+                    visibleGames.forEach { game ->
                         val id = game.appId
                         val upd = updateStatusByApp[id]
                         val needsUpdate = upd?.hasUpdate == true ||
@@ -905,21 +994,24 @@ fun HomeTab(
                             ) {
                                 if (targetStatus.mode == ConnectionMode.FULLY_CONNECTED && targetStatus.packageName != null) {
                                     OutlinedButton(
-                                        enabled = pushingAppId != id && updatingAppId != id,
+                                        enabled = pushingAppId != id && updatingAppId != id && !rePushAllBusy,
                                         onClick = {
                                             scope.launch {
                                                 pushingAppId = id
-                                                val luaFile = File(settings.downloadFolder, "stplug-in/$id.lua")
-                                                val content = runCatching { luaFile.readText(Charsets.UTF_8) }.getOrDefault("")
-                                                val depotCacheDir = File(settings.downloadFolder, "depotcache")
-                                                val res = TargetAppBridge.pushLuaGame(
-                                                    context = context,
-                                                    pkg = targetStatus.packageName,
-                                                    appId = id,
-                                                    name = game.name,
-                                                    luaContent = content,
-                                                    depotCacheDir = depotCacheDir
-                                                )
+                                                libraryMsg = "Pushing ${game.name}..."
+                                                val res = withContext(Dispatchers.IO) {
+                                                    val luaFile = File(settings.downloadFolder, "stplug-in/$id.lua")
+                                                    val content = runCatching { luaFile.readText(Charsets.UTF_8) }.getOrDefault("")
+                                                    val depotCacheDir = File(settings.downloadFolder, "depotcache")
+                                                    TargetAppBridge.pushLuaGame(
+                                                        context = context,
+                                                        pkg = targetStatus.packageName,
+                                                        appId = id,
+                                                        name = game.name,
+                                                        luaContent = content,
+                                                        depotCacheDir = depotCacheDir
+                                                    )
+                                                }
                                                 libraryMsg = res.fold(
                                                     onSuccess = { "Pushed ${game.name} from local cache (0 fetches): $it" },
                                                     onFailure = { "Bridge push failed: ${it.message}" }
@@ -943,7 +1035,7 @@ fun HomeTab(
                                                     luaInstaller.applyUpdatedManifestPins(id, latest)
                                                 }
                                                 val readyCount = luaInstaller.ensureDepotManifests(id, apiClient, safUri)
-                                                installedGames = luaInstaller.listInstalledLuaGames()
+                                                refreshAppGames()
                                                 updateStatusByApp = updateStatusByApp + (id to luaInstaller.checkGameUpdateAsync(id))
                                                 var pushNote = ""
                                                 if (targetStatus.mode == ConnectionMode.FULLY_CONNECTED && targetStatus.packageName != null) {
@@ -959,7 +1051,7 @@ fun HomeTab(
                                                         depotCacheDir = depotCacheDir
                                                     )
                                                     pushNote = pushRes.fold(
-                                                        onSuccess = { " → pushed to BannerHub" },
+                                                        onSuccess = { " → pushed to ${targetStatus.appName}" },
                                                         onFailure = { " (push error: ${it.message})" }
                                                     )
                                                 }
@@ -972,8 +1064,9 @@ fun HomeTab(
                                     }
                                 }
                                 TextButton(onClick = {
+                                    targetStatus.packageName?.let { settings.removeAppSyncedId(it, id) }
                                     luaInstaller.removeInstalledLua(id)
-                                    installedGames = luaInstaller.listInstalledLuaGames()
+                                    refreshAppGames()
                                 }) {
                                     Text("Remove")
                                 }
@@ -988,17 +1081,23 @@ fun HomeTab(
                 }
             }
         }
+    }
 
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("CloudRedirect Core", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text("Provider: ${settings.cloudProvider} | Account: ${settings.cloudAccountId}", style = MaterialTheme.typography.bodySmall)
-                Text(
-                    text = if (nativeVer != null) "Native Core: v$nativeVer (loaded)" else "Native Core: not loaded",
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
-        }
+    if (rePushAllBusy) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Pushing Games...") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(rePushLabel, style = MaterialTheme.typography.bodySmall)
+                    LinearProgressIndicator(
+                        progress = { rePushProgress.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {}
+        )
     }
 }
 
@@ -1006,6 +1105,7 @@ fun HomeTab(
 fun AddGamesTab(
     settings: SettingsStore,
     targetStatus: TargetAppStatus,
+    installedApps: List<TargetAppStatus>,
     apiClient: LuaToolsApiClient,
     hubcapService: HubcapService,
     luaInstaller: LuaInstaller,
@@ -1044,32 +1144,60 @@ fun AddGamesTab(
         runSearch(q)
     }
 
+    suspend fun pushToActiveTargets(appId: Long, name: String, luaContent: String): Pair<Boolean, String> {
+        val depotCacheDir = File(settings.downloadFolder, "depotcache")
+        val targets = if (settings.syncAllConnectedApps) {
+            installedApps.filter { it.mode == ConnectionMode.FULLY_CONNECTED && it.packageName != null }
+        } else {
+            listOfNotNull(
+                targetStatus.takeIf { it.mode == ConnectionMode.FULLY_CONNECTED && it.packageName != null }
+            )
+        }
+        if (targets.isEmpty()) {
+            return false to "$name ($appId) saved locally in stplug-in/"
+        }
+        var okCount = 0
+        var lastError: String? = null
+        for (t in targets) {
+            val res = TargetAppBridge.pushLuaGame(
+                context = context,
+                pkg = t.packageName!!,
+                appId = appId,
+                name = name,
+                luaContent = luaContent,
+                depotCacheDir = depotCacheDir
+            )
+            if (res.isSuccess) okCount++ else lastError = res.exceptionOrNull()?.message
+        }
+        return if (okCount > 0) {
+            val names = targets.joinToString { it.appName }
+            true to "pushed to $names"
+        } else {
+            false to "push failed: ${lastError ?: "unknown"}"
+        }
+    }
+
     suspend fun getGameOneClick(item: SteamSearchResult) {
         busyAppId = item.appId
         statusIsError = false
 
-        // If already saved locally, push from local cache without burning API fetch quota!
+        // Smart cache reuse: if already saved locally, check if it's latest before ever hitting LuaTools API
         val existingLua = File(settings.downloadFolder, "stplug-in/${item.appId}.lua")
         if (existingLua.isFile && existingLua.length() > 0L) {
-            if (targetStatus.mode == ConnectionMode.FULLY_CONNECTED && targetStatus.packageName != null) {
-                val luaContent = runCatching { existingLua.readText(Charsets.UTF_8) }.getOrDefault("")
-                val depotCacheDir = File(settings.downloadFolder, "depotcache")
-                val pushRes = TargetAppBridge.pushLuaGame(
-                    context = context,
-                    pkg = targetStatus.packageName,
-                    appId = item.appId,
-                    name = item.name,
-                    luaContent = luaContent,
-                    depotCacheDir = depotCacheDir
-                )
-                statusIsError = pushRes.isFailure
-                statusMsg = pushRes.fold(
-                    onSuccess = { "${item.name} already saved locally → pushed to BannerHub (0 fetches)" },
-                    onFailure = { "Saved locally, push failed: ${it.message}" }
-                )
-            } else {
-                statusMsg = "${item.name} (${item.appId}) is already saved locally in stplug-in/"
+            statusMsg = "Checking local cache for ${item.name}..."
+            val upd = luaInstaller.checkGameUpdateAsync(item.appId)
+            val needsManifests = upd.missingManifests > 0 || (settings.autoUpdateApps && upd.hasUpdate)
+            if (needsManifests) {
+                statusMsg = "Updating manifests for ${item.name} from cache/Steam..."
+                if (upd.latestWindowsGids.isNotEmpty()) {
+                    luaInstaller.applyUpdatedManifestPins(item.appId, upd.latestWindowsGids)
+                }
+                luaInstaller.ensureDepotManifests(item.appId, apiClient, safUri)
             }
+            val luaContent = runCatching { existingLua.readText(Charsets.UTF_8) }.getOrDefault("")
+            val (ok, msg) = pushToActiveTargets(item.appId, item.name, luaContent)
+            statusIsError = !ok && targetStatus.mode == ConnectionMode.FULLY_CONNECTED
+            statusMsg = "${item.name}: reused local cache${if (needsManifests) " (updated manifests)" else " (0 API fetches)"} → $msg"
             busyAppId = null
             return
         }
@@ -1099,26 +1227,11 @@ fun AddGamesTab(
                 } else {
                     statusMsg = "Fetching depot manifests for ${item.name}..."
                     val totalManifests = luaInstaller.ensureDepotManifests(item.appId, apiClient, safUri)
-                    var pushSuffix = ""
-                    if (targetStatus.mode == ConnectionMode.FULLY_CONNECTED && targetStatus.packageName != null) {
-                        val luaFile = File(settings.downloadFolder, "stplug-in/${item.appId}.lua")
-                        val luaContent = runCatching { luaFile.readText(Charsets.UTF_8) }.getOrDefault("")
-                        val depotCacheDir = File(settings.downloadFolder, "depotcache")
-                        val pushRes = TargetAppBridge.pushLuaGame(
-                            context = context,
-                            pkg = targetStatus.packageName,
-                            appId = item.appId,
-                            name = item.name,
-                            luaContent = luaContent,
-                            depotCacheDir = depotCacheDir
-                        )
-                        pushSuffix = pushRes.fold(
-                            onSuccess = { " → pushed to BannerHub" },
-                            onFailure = { " (push error: ${it.message})" }
-                        )
-                    }
+                    val luaFile = File(settings.downloadFolder, "stplug-in/${item.appId}.lua")
+                    val luaContent = runCatching { luaFile.readText(Charsets.UTF_8) }.getOrDefault("")
+                    val (_, pushNote) = pushToActiveTargets(item.appId, item.name, luaContent)
                     statusIsError = false
-                    statusMsg = "Added ${item.name} (${item.appId}) via ${preferredSource.source}: lua=${res.luaInstalled}, manifests=$totalManifests$pushSuffix"
+                    statusMsg = "Added ${item.name} (${item.appId}) via ${preferredSource.source}: lua=${res.luaInstalled}, manifests=$totalManifests → $pushNote"
                 }
                 busyAppId = null
                 return
@@ -1256,6 +1369,16 @@ fun AddGamesTab(
     }
 }
 
+private data class FixGameGroup(
+    val appId: String,
+    val name: String,
+    val communityFixes: List<org.json.JSONObject>,
+    val denuvoListing: DenuvoGameListing?
+) {
+    val totalCount: Int
+        get() = communityFixes.size + (denuvoListing?.fixCount ?: 0)
+}
+
 @Composable
 fun FixesTab(
     targetStatus: TargetAppStatus,
@@ -1272,6 +1395,8 @@ fun FixesTab(
     var listings by remember { mutableStateOf<List<DenuvoGameListing>>(emptyList()) }
     var fixesByApp by remember { mutableStateOf<Map<String, List<DenuvoFix>>>(emptyMap()) }
     var communityFixes by remember { mutableStateOf<List<org.json.JSONObject>>(emptyList()) }
+    var selectedGroup by remember { mutableStateOf<FixGameGroup?>(null) }
+    var loadingGameFixes by remember { mutableStateOf(false) }
     var statusMsg by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(targetStatus.packageName) {
@@ -1279,6 +1404,9 @@ fun FixesTab(
         val localIds = luaInstaller.listInstalledLuaGames().map { it.appId.toString() }.toMutableSet()
         if (targetStatus.mode == ConnectionMode.FULLY_CONNECTED && targetStatus.packageName != null) {
             installedFixes = TargetAppBridge.getInstalledFixes(context, targetStatus.packageName)
+            TargetAppBridge.listLuaApps(context, targetStatus.packageName)?.forEach {
+                localIds.add(it.toString())
+            }
             TargetAppBridge.getBridgeStatus(context, targetStatus.packageName).onSuccess { jsonStr ->
                 runCatching {
                     val arr = org.json.JSONObject(jsonStr).optJSONArray("attached")
@@ -1311,12 +1439,35 @@ fun FixesTab(
         loading = false
     }
 
-    val filtered = remember(listings, filter, onlyInstalled, installedAppIds) {
-        listings.filter { game ->
-            (!onlyInstalled || installedAppIds.contains(game.appId)) &&
+    val groupedGames = remember(listings, communityFixes, filter, onlyInstalled, installedAppIds) {
+        val byId = linkedMapOf<String, FixGameGroup>()
+        for (cf in communityFixes) {
+            val id = cf.optString("appId")
+            if (id.isBlank()) continue
+            val existing = byId[id]
+            val name = cf.optString("name", existing?.name ?: "AppID $id")
+            byId[id] = FixGameGroup(
+                appId = id,
+                name = name,
+                communityFixes = (existing?.communityFixes ?: emptyList()) + cf,
+                denuvoListing = existing?.denuvoListing
+            )
+        }
+        for (l in listings) {
+            val existing = byId[l.appId]
+            byId[l.appId] = FixGameGroup(
+                appId = l.appId,
+                name = l.name.ifBlank { existing?.name ?: "AppID ${l.appId}" },
+                communityFixes = existing?.communityFixes ?: emptyList(),
+                denuvoListing = l
+            )
+        }
+        byId.values.filter { group ->
+            group.totalCount > 0 &&
+                (!onlyInstalled || installedAppIds.contains(group.appId)) &&
                 (filter.isBlank() ||
-                    game.name.contains(filter, ignoreCase = true) ||
-                    game.appId.contains(filter, ignoreCase = true))
+                    group.name.contains(filter, ignoreCase = true) ||
+                    group.appId.contains(filter, ignoreCase = true))
         }
     }
 
@@ -1346,200 +1497,238 @@ fun FixesTab(
             Spacer(Modifier.height(8.dp))
         }
 
-        val filteredCommunity = remember(communityFixes, filter, onlyInstalled, installedAppIds) {
-            communityFixes.filter {
-                val id = it.optString("appId")
-                (!onlyInstalled || installedAppIds.contains(id)) &&
-                    (filter.isBlank() ||
-                        it.optString("name").contains(filter, ignoreCase = true) ||
-                        id.contains(filter, ignoreCase = true))
-            }
-        }
-
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(filteredCommunity, key = { "gh_${it.optString("appId")}_${it.optString("title")}" }) { ghFix ->
-                val appIdStr = ghFix.optString("appId")
-                val gameName = ghFix.optString("name", "AppID $appIdStr")
-                val title = ghFix.optString("title", "Community Fix")
-                val desc = ghFix.optString("description", "")
-                val remoteVer = ghFix.optString("version", "1.0.0")
-                val zipUrl = ghFix.optString("zipUrl", "")
-                val installedVer = installedFixes[appIdStr]
-                val isInstalled = installedVer != null
-                val hasUpdate = isInstalled && installedVer != remoteVer
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("$gameName ($appIdStr) — $title", fontWeight = FontWeight.SemiBold)
-                        if (desc.isNotBlank()) Text(desc, style = MaterialTheme.typography.bodySmall)
-                        if (zipUrl.isNotBlank()) {
-                            val doApply: () -> Unit = {
+            items(groupedGames, key = { it.appId }) { group ->
+                val installedVer = installedFixes[group.appId]
+                val countLabel = if (group.totalCount == 1) "1 fix" else "${group.totalCount} fixes"
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            selectedGroup = group
+                            if (group.denuvoListing != null && fixesByApp[group.appId] == null) {
                                 scope.launch {
-                                    statusMsg = "Downloading fix..."
-                                    val tmp = File(context.cacheDir, "gh_fix_$appIdStr.zip")
-                                    val dl = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                                        runCatching {
-                                            val client = okhttp3.OkHttpClient()
-                                            val req = okhttp3.Request.Builder().url(zipUrl).build()
-                                            client.newCall(req).execute().use { resp ->
-                                                if (!resp.isSuccessful) error("HTTP ${resp.code}")
-                                                resp.body!!.byteStream().use { ins ->
-                                                    tmp.outputStream().use { os -> ins.copyTo(os) }
-                                                }
-                                            }
-                                            tmp
-                                        }
-                                    }
-                                    statusMsg = dl.fold(
-                                        onSuccess = { zip ->
-                                            val localRes = luaInstaller.extractFixZip(zip, appIdStr)
-                                                .getOrElse { "Extract error: ${it.message}" }
-                                            val appNum = appIdStr.toLongOrNull() ?: 0L
-                                            if (appNum > 0L &&
-                                                targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
-                                                targetStatus.packageName != null
-                                            ) {
-                                                TargetAppBridge.applyFix(
-                                                    context = context,
-                                                    pkg = targetStatus.packageName,
-                                                    appId = appNum,
-                                                    gameName = gameName,
-                                                    fixZipFile = zip,
-                                                    fixVersion = remoteVer
-                                                ).fold(
-                                                    onSuccess = {
-                                                        installedFixes = installedFixes + (appIdStr to remoteVer)
-                                                        "$localRes\n$it"
-                                                    },
-                                                    onFailure = { "$localRes\nBridge apply failed: ${it.message}" }
-                                                )
-                                            } else localRes
-                                        },
-                                        onFailure = { "Error: ${it.message}" }
-                                    )
-                                }
-                            }
-
-                            if (!isInstalled) {
-                                Button(onClick = doApply) { Text("Apply") }
-                            } else {
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Button(
-                                        enabled = hasUpdate,
-                                        onClick = doApply
-                                    ) { Text("Update") }
-                                    OutlinedButton(onClick = {
-                                        scope.launch {
-                                            val appNum = appIdStr.toLongOrNull() ?: 0L
-                                            if (appNum > 0L &&
-                                                targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
-                                                targetStatus.packageName != null
-                                            ) {
-                                                TargetAppBridge.removeFix(context, targetStatus.packageName, appNum).fold(
-                                                    onSuccess = {
-                                                        installedFixes = installedFixes - appIdStr
-                                                        statusMsg = it
-                                                    },
-                                                    onFailure = { statusMsg = "Remove failed: ${it.message}" }
-                                                )
-                                            }
-                                        }
-                                    }) { Text("Remove") }
+                                    loadingGameFixes = true
+                                    val loaded = runCatching { apiClient.getDenuvoFixesAsync(group.appId) }
+                                        .getOrDefault(emptyList())
+                                    fixesByApp = fixesByApp + (group.appId to loaded)
+                                    loadingGameFixes = false
                                 }
                             }
                         }
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        AsyncImage(
+                            model = "https://shared.steamstatic.com/store_item_assets/steam/apps/${group.appId}/header.jpg",
+                            contentDescription = group.name,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .width(88.dp)
+                                .height(42.dp)
+                                .clip(MaterialTheme.shapes.small)
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(group.name, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                            Text(
+                                text = "AppID ${group.appId} • $countLabel" +
+                                    (if (installedVer != null) " • Installed (v$installedVer)" else ""),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (installedVer != null) Color(0xFF81C784) else MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "View Fixes")
                     }
                 }
             }
-            items(filtered, key = { it.appId }) { game ->
-                val fixes = fixesByApp[game.appId]
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("${game.name} (${game.appId})", fontWeight = FontWeight.SemiBold)
-                        Text("${game.fixCount} fix(es) available", style = MaterialTheme.typography.bodySmall)
-                        OutlinedButton(onClick = {
-                            scope.launch {
-                                val loaded = runCatching { apiClient.getDenuvoFixesAsync(game.appId) }.getOrDefault(emptyList())
-                                fixesByApp = fixesByApp + (game.appId to loaded)
-                            }
-                        }) {
-                            Text(if (fixes == null) "Load Fixes" else "Refresh Fixes")
-                        }
-                        fixes?.forEach { fix ->
-                            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-                                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text(fix.title, fontWeight = FontWeight.Medium)
-                                    if (!fix.description.isNullOrBlank()) {
-                                        Text(fix.description, style = MaterialTheme.typography.bodySmall)
-                                    }
-                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        if (fix.hasFix) {
-                                            Button(onClick = {
-                                                scope.launch {
-                                                    statusMsg = "Downloading fix..."
-                                                    val tmp = File(context.cacheDir, "fix_${game.appId}.zip")
-                                                    val dl = apiClient.downloadDenuvoAsync(fix.id, "fix", tmp)
-                                                    statusMsg = dl.fold(
-                                                        onSuccess = { zip ->
-                                                            val localRes = luaInstaller.extractFixZip(zip, game.appId)
-                                                                .getOrElse { "Extract error: ${it.message}" }
-                                                            val appNum = game.appId.toLongOrNull() ?: 0L
-                                                            if (appNum > 0L &&
-                                                                targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
-                                                                targetStatus.packageName != null
-                                                            ) {
-                                                                val bridgeRes = TargetAppBridge.applyFix(
-                                                                    context = context,
-                                                                    pkg = targetStatus.packageName,
-                                                                    appId = appNum,
-                                                                    gameName = game.name,
-                                                                    fixZipFile = zip
-                                                                )
-                                                                bridgeRes.fold(
-                                                                    onSuccess = { "$localRes\n$it" },
-                                                                    onFailure = { "$localRes\nBridge apply failed: ${it.message}" }
-                                                                )
-                                                            } else {
-                                                                localRes
-                                                            }
-                                                        },
-                                                        onFailure = { "Error: ${it.message}" }
-                                                    )
+        }
+    }
+
+    selectedGroup?.let { group ->
+        val apiFixes = fixesByApp[group.appId].orEmpty()
+        AlertDialog(
+            onDismissRequest = { selectedGroup = null },
+            title = { Text("${group.name} (${group.appId})") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    if (loadingGameFixes) {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                    }
+
+                    group.communityFixes.forEach { ghFix ->
+                        val appIdStr = group.appId
+                        val title = ghFix.optString("title", "Community Fix")
+                        val desc = ghFix.optString("description", "")
+                        val remoteVer = ghFix.optString("version", "1.0.0")
+                        val zipUrl = ghFix.optString("zipUrl", "")
+                        val installedVer = installedFixes[appIdStr]
+                        val isInstalled = installedVer != null
+                        val hasUpdate = isInstalled && installedVer != remoteVer
+
+                        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                            Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("$title (v$remoteVer)", fontWeight = FontWeight.SemiBold)
+                                if (desc.isNotBlank()) Text(desc, style = MaterialTheme.typography.bodySmall)
+                                if (zipUrl.isNotBlank()) {
+                                    val doApply: () -> Unit = {
+                                        scope.launch {
+                                            statusMsg = "Downloading fix..."
+                                            val tmp = File(context.cacheDir, "gh_fix_$appIdStr.zip")
+                                            val dl = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                                runCatching {
+                                                    val client = okhttp3.OkHttpClient()
+                                                    val req = okhttp3.Request.Builder().url(zipUrl).build()
+                                                    client.newCall(req).execute().use { resp ->
+                                                        if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                                                        resp.body!!.byteStream().use { ins ->
+                                                            tmp.outputStream().use { os -> ins.copyTo(os) }
+                                                        }
+                                                    }
+                                                    tmp
                                                 }
-                                            }) {
-                                                Text("Download Fix")
                                             }
+                                            statusMsg = dl.fold(
+                                                onSuccess = { zip ->
+                                                    val localRes = luaInstaller.extractFixZip(zip, appIdStr)
+                                                        .getOrElse { "Extract error: ${it.message}" }
+                                                    val appNum = appIdStr.toLongOrNull() ?: 0L
+                                                    if (appNum > 0L &&
+                                                        targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
+                                                        targetStatus.packageName != null
+                                                    ) {
+                                                        TargetAppBridge.applyFix(
+                                                            context = context,
+                                                            pkg = targetStatus.packageName,
+                                                            appId = appNum,
+                                                            gameName = group.name,
+                                                            fixZipFile = zip,
+                                                            fixVersion = remoteVer
+                                                        ).fold(
+                                                            onSuccess = {
+                                                                installedFixes = installedFixes + (appIdStr to remoteVer)
+                                                                "$localRes\n$it"
+                                                            },
+                                                            onFailure = { "$localRes\nBridge apply failed: ${it.message}" }
+                                                        )
+                                                    } else localRes
+                                                },
+                                                onFailure = { "Error: ${it.message}" }
+                                            )
                                         }
-                                        if (fix.hasManifest) {
+                                    }
+                                    if (!isInstalled) {
+                                        Button(onClick = doApply) { Text("Apply") }
+                                    } else {
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Button(enabled = hasUpdate, onClick = doApply) { Text("Update") }
                                             OutlinedButton(onClick = {
                                                 scope.launch {
-                                                    statusMsg = "Downloading fix manifest..."
-                                                    val tmp = File(context.cacheDir, "fix_manifest_${game.appId}.zip")
-                                                    val dl = apiClient.downloadDenuvoAsync(fix.id, "manifest", tmp)
-                                                    statusMsg = dl.fold(
-                                                        onSuccess = { zip ->
-                                                            val appNum = game.appId.toLongOrNull() ?: 0L
-                                                            if (appNum > 0L) {
-                                                                val res = luaInstaller.installZip(zip, appNum, forceLocked = true)
-                                                                "Fix manifest installed: lua=${res.luaInstalled}, manifests=${res.manifestCount}"
-                                                            } else {
-                                                                "Saved to ${zip.absolutePath}"
-                                                            }
-                                                        },
-                                                        onFailure = { "Error: ${it.message}" }
-                                                    )
+                                                    val appNum = appIdStr.toLongOrNull() ?: 0L
+                                                    if (appNum > 0L &&
+                                                        targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
+                                                        targetStatus.packageName != null
+                                                    ) {
+                                                        TargetAppBridge.removeFix(context, targetStatus.packageName, appNum).fold(
+                                                            onSuccess = {
+                                                                installedFixes = installedFixes - appIdStr
+                                                                statusMsg = it
+                                                            },
+                                                            onFailure = { statusMsg = "Remove failed: ${it.message}" }
+                                                        )
+                                                    }
                                                 }
-                                            }) {
-                                                Text("Manifest")
-                                            }
+                                            }) { Text("Remove") }
                                         }
                                     }
                                 }
                             }
                         }
                     }
+
+                    apiFixes.forEach { fix ->
+                        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                            Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(fix.title, fontWeight = FontWeight.SemiBold)
+                                if (!fix.description.isNullOrBlank()) {
+                                    Text(fix.description, style = MaterialTheme.typography.bodySmall)
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    if (fix.hasFix) {
+                                        Button(onClick = {
+                                            scope.launch {
+                                                statusMsg = "Downloading fix..."
+                                                val tmp = File(context.cacheDir, "fix_${group.appId}.zip")
+                                                val dl = apiClient.downloadDenuvoAsync(fix.id, "fix", tmp)
+                                                statusMsg = dl.fold(
+                                                    onSuccess = { zip ->
+                                                        val localRes = luaInstaller.extractFixZip(zip, group.appId)
+                                                            .getOrElse { "Extract error: ${it.message}" }
+                                                        val appNum = group.appId.toLongOrNull() ?: 0L
+                                                        if (appNum > 0L &&
+                                                            targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
+                                                            targetStatus.packageName != null
+                                                        ) {
+                                                            TargetAppBridge.applyFix(
+                                                                context = context,
+                                                                pkg = targetStatus.packageName,
+                                                                appId = appNum,
+                                                                gameName = group.name,
+                                                                fixZipFile = zip
+                                                            ).fold(
+                                                                onSuccess = { "$localRes\n$it" },
+                                                                onFailure = { "$localRes\nBridge apply failed: ${it.message}" }
+                                                            )
+                                                        } else localRes
+                                                    },
+                                                    onFailure = { "Error: ${it.message}" }
+                                                )
+                                            }
+                                        }) { Text("Download Fix") }
+                                    }
+                                    if (fix.hasManifest) {
+                                        OutlinedButton(onClick = {
+                                            scope.launch {
+                                                statusMsg = "Downloading fix manifest..."
+                                                val tmp = File(context.cacheDir, "fix_manifest_${group.appId}.zip")
+                                                val dl = apiClient.downloadDenuvoAsync(fix.id, "manifest", tmp)
+                                                statusMsg = dl.fold(
+                                                    onSuccess = { zip ->
+                                                        val appNum = group.appId.toLongOrNull() ?: 0L
+                                                        if (appNum > 0L) {
+                                                            val res = luaInstaller.installZip(zip, appNum, forceLocked = true)
+                                                            "Fix manifest installed: lua=${res.luaInstalled}, manifests=${res.manifestCount}"
+                                                        } else {
+                                                            "Saved to ${zip.absolutePath}"
+                                                        }
+                                                    },
+                                                    onFailure = { "Error: ${it.message}" }
+                                                )
+                                            }
+                                        }) { Text("Manifest") }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { selectedGroup = null }) {
+                    Text("Close")
                 }
             }
-        }
+        )
     }
 }
 
@@ -1576,58 +1765,92 @@ fun CloudRedirectTab(
     var authenticated by remember { mutableStateOf(false) }
     var scanning by remember { mutableStateOf(false) }
     var oauthBusy by remember { mutableStateOf(false) }
+    var detectedGameCount by remember { mutableStateOf(0) }
     var detectedGames by remember { mutableStateOf<List<DetectedCloudGame>>(emptyList()) }
+    var showDetails by remember { mutableStateOf(false) }
     var statusMsg by remember { mutableStateOf("") }
     var showAdvanced by remember { mutableStateOf(false) }
     var manualAppId by remember { mutableStateOf("") }
     var manualCloudRoot by remember { mutableStateOf("") }
+    var autoSync by remember { mutableStateOf(settings.autoSyncOnLaunch) }
+    var cloudAccountId by remember { mutableStateOf(settings.cloudAccountId) }
+    val nativeVer = remember(cloudService.isNativeAvailable) { cloudService.getNativeVersion() }
 
     val selectedOption = cloudProviderOptions.firstOrNull { it.id == selectedProviderId }
         ?: cloudProviderOptions.first()
 
-    suspend fun refreshCloudState(providerId: String = selectedProviderId) {
-        val status = cloudService.authStatus(providerId)
+    suspend fun refreshCloudState(
+        providerId: String = selectedProviderId,
+        forceRescan: Boolean = false,
+        loadDetails: Boolean = false
+    ) {
+        val status = withContext(Dispatchers.IO) { cloudService.authStatus(providerId) }
         authenticated = status.optBoolean("authenticated", false)
-        if (authenticated) {
-            scanning = true
-            val scan = cloudService.discoverCloudGames(providerId)
-            if (scan.optBoolean("success", false)) {
-                val arr = scan.optJSONArray("games")
-                val found = buildList {
-                    if (arr != null) {
-                        for (i in 0 until arr.length()) {
-                            val g = arr.getJSONObject(i)
-                            add(
-                                DetectedCloudGame(
-                                    accountId = g.optString("account_id"),
-                                    appId = g.optString("app_id")
-                                )
+        if (!authenticated) {
+            detectedGameCount = 0
+            detectedGames = emptyList()
+            showDetails = false
+            statusMsg = "Not connected to ${selectedOption.label}."
+            return
+        }
+
+        // Use cached scan unless forceRescan is requested or no cache exists yet
+        if (!forceRescan && settings.hasCachedCloudScan(providerId)) {
+            val cached = settings.getCachedCloudGames(providerId)
+                .map { DetectedCloudGame(accountId = it.first, appId = it.second) }
+            detectedGameCount = cached.size
+            if (loadDetails) {
+                detectedGames = cached
+                showDetails = true
+            }
+            statusMsg = "Connected to ${selectedOption.label}. ${cached.size} game(s) in cloud (cached)."
+            return
+        }
+
+        scanning = true
+        val scan = withContext(Dispatchers.IO) { cloudService.discoverCloudGames(providerId) }
+        if (scan.optBoolean("success", false)) {
+            val arr = scan.optJSONArray("games")
+            val found = buildList {
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val g = arr.getJSONObject(i)
+                        add(
+                            DetectedCloudGame(
+                                accountId = g.optString("account_id"),
+                                appId = g.optString("app_id")
                             )
-                        }
+                        )
                     }
                 }
-                detectedGames = found
-                if (found.isNotEmpty() && settings.cloudAccountId == "0") {
-                    settings.cloudAccountId = found.first().accountId
-                }
-                statusMsg = if (found.isEmpty()) {
-                    "Connected to ${selectedOption.label}. No existing cloud games found yet."
-                } else {
-                    "Connected to ${selectedOption.label}. Detected ${found.size} game(s) in cloud."
-                }
-            } else {
-                detectedGames = emptyList()
-                statusMsg = scan.optString("error", "Failed to scan cloud games")
             }
-            scanning = false
+            settings.setCachedCloudGames(providerId, found.map { it.accountId to it.appId })
+            detectedGameCount = found.size
+            if (found.isNotEmpty() && settings.cloudAccountId == "0") {
+                settings.cloudAccountId = found.first().accountId
+                cloudAccountId = settings.cloudAccountId
+            }
+            if (loadDetails) {
+                detectedGames = found
+                showDetails = true
+            }
+            statusMsg = if (found.isEmpty()) {
+                "Connected to ${selectedOption.label}. No existing cloud games found yet."
+            } else {
+                "Connected to ${selectedOption.label}. ${found.size} game(s) in cloud."
+            }
         } else {
+            detectedGameCount = 0
             detectedGames = emptyList()
-            statusMsg = "Not connected to ${selectedOption.label}."
+            statusMsg = scan.optString("error", "Failed to scan cloud games")
         }
+        scanning = false
     }
 
     LaunchedEffect(selectedProviderId) {
-        refreshCloudState(selectedProviderId)
+        showDetails = false
+        detectedGames = emptyList()
+        refreshCloudState(selectedProviderId, forceRescan = false, loadDetails = false)
     }
 
     Column(
@@ -1682,17 +1905,44 @@ fun CloudRedirectTab(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = if (authenticated) "Status: Connected" else "Status: Not connected",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (authenticated) Color(0xFF81C784) else Color(0xFFFFB74D)
-                    )
+                    Column {
+                        Text(
+                            text = if (authenticated) "Status: Connected" else "Status: Not connected",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (authenticated) Color(0xFF81C784) else Color(0xFFFFB74D)
+                        )
+                        if (authenticated) {
+                            Text(
+                                text = "Cloud Games: $detectedGameCount",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
                     if (authenticated) {
-                        OutlinedButton(
-                            enabled = !scanning,
-                            onClick = { scope.launch { refreshCloudState(selectedProviderId) } }
-                        ) {
-                            Text("Rescan Games")
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (!showDetails && detectedGameCount > 0) {
+                                OutlinedButton(
+                                    enabled = !scanning,
+                                    onClick = {
+                                        scope.launch {
+                                            refreshCloudState(selectedProviderId, forceRescan = false, loadDetails = true)
+                                        }
+                                    }
+                                ) {
+                                    Text("Show Details")
+                                }
+                            }
+                            OutlinedButton(
+                                enabled = !scanning,
+                                onClick = {
+                                    scope.launch {
+                                        refreshCloudState(selectedProviderId, forceRescan = true, loadDetails = true)
+                                    }
+                                }
+                            ) {
+                                Text("Rescan")
+                            }
                         }
                     }
                 }
@@ -1727,11 +1977,53 @@ fun CloudRedirectTab(
                     )
                     OutlinedButton(
                         enabled = !scanning,
-                        onClick = { scope.launch { refreshCloudState(selectedOption.id) } }
+                        onClick = { scope.launch { refreshCloudState(selectedOption.id, loadDetails = true) } }
                     ) {
                         Text("Check & Scan ${selectedOption.label}")
                     }
                 }
+            }
+        }
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Cloud Sync Settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(
+                    text = if (nativeVer != null) "Native Core: v$nativeVer (loaded)" else "Native Core: not loaded",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Auto-Sync on Launch / Exit")
+                        Text(
+                            "Runs automatically on game launch & exit",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = autoSync,
+                        onCheckedChange = {
+                            autoSync = it
+                            settings.autoSyncOnLaunch = it
+                        }
+                    )
+                }
+                OutlinedTextField(
+                    value = cloudAccountId,
+                    onValueChange = {
+                        cloudAccountId = it
+                        settings.cloudAccountId = it
+                    },
+                    label = { Text("Steam Account ID") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
         }
 
@@ -1743,7 +2035,7 @@ fun CloudRedirectTab(
             Text(statusMsg, style = MaterialTheme.typography.bodySmall)
         }
 
-        if (detectedGames.isNotEmpty()) {
+        if (showDetails && detectedGames.isNotEmpty()) {
             Text(
                 "Games Found in Cloud (${detectedGames.size})",
                 style = MaterialTheme.typography.titleMedium,
@@ -1778,14 +2070,18 @@ fun CloudRedirectTab(
                         Button(onClick = {
                             scope.launch {
                                 val targetRoot = "${settings.downloadFolder}/CloudSaves/${game.appId}"
-                                File(targetRoot).mkdirs()
-                                val res = cloudService.syncRemoteApp(
-                                    settings.cloudProvider,
-                                    game.accountId,
-                                    game.appId,
-                                    targetRoot
-                                )
-                                statusMsg = "Sync AppID ${game.appId}: ${res.toString()}"
+                                val res = withContext(Dispatchers.IO) {
+                                    File(targetRoot).mkdirs()
+                                    cloudService.syncRemoteApp(
+                                        settings.cloudProvider,
+                                        game.accountId,
+                                        game.appId,
+                                        targetRoot
+                                    )
+                                }
+                                settings.upsertCachedCloudGame(settings.cloudProvider, game.accountId, game.appId)
+                                detectedGameCount = settings.getCachedCloudGames(settings.cloudProvider).size
+                                statusMsg = "Sync AppID ${game.appId}: $res"
                             }
                         }) {
                             Icon(Icons.Default.CloudSync, contentDescription = null)
@@ -1847,11 +2143,14 @@ fun CloudRedirectTab(
 @Composable
 fun MergedOptionsTab(
     settings: SettingsStore,
+    authService: AuthService,
     targetStatus: TargetAppStatus,
+    installedApps: List<TargetAppStatus>,
     safUri: Uri?,
     safValidation: SafValidationResult?,
     hubcapService: HubcapService,
-    cloudService: CloudRedirectService,
+    luaInstaller: LuaInstaller,
+    onSelectTarget: (String) -> Unit,
     onRefreshBridge: () -> Unit,
     onGrantSaf: () -> Unit,
     onClearSaf: () -> Unit,
@@ -1859,15 +2158,73 @@ fun MergedOptionsTab(
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+
+    var signedIn by remember { mutableStateOf(authService.isSignedIn) }
+    var botCode by remember { mutableStateOf("") }
+    var authStatusMsg by remember { mutableStateOf<String?>(null) }
+    var authBusy by remember { mutableStateOf(false) }
+
     var autoUpdateApps by remember { mutableStateOf(settings.autoUpdateApps) }
     var downloadFolder by remember { mutableStateOf(settings.downloadFolder) }
     var hubcapKey by remember { mutableStateOf(settings.hubcapApiKey) }
     var hubcapStatus by remember { mutableStateOf<String?>(null) }
-    var cloudProvider by remember { mutableStateOf(settings.cloudProvider) }
-    var cloudAccountId by remember { mutableStateOf(settings.cloudAccountId) }
-    var autoSync by remember { mutableStateOf(settings.autoSyncOnLaunch) }
 
-    val nativeVer = remember(cloudService.isNativeAvailable) { cloudService.getNativeVersion() }
+    var syncAllApps by remember { mutableStateOf(settings.syncAllConnectedApps) }
+    var showSyncConfirmDialog by remember { mutableStateOf(false) }
+    var syncingNow by remember { mutableStateOf(false) }
+    var syncProgress by remember { mutableFloatStateOf(0f) }
+    var syncCurrentLabel by remember { mutableStateOf("") }
+    var syncSummaryMsg by remember { mutableStateOf<String?>(null) }
+
+    var showAddPlatformDialog by remember { mutableStateOf(false) }
+    var addPlatformSelection by remember { mutableStateOf<TargetPlatform?>(null) }
+    var addedPlatformIds by remember { mutableStateOf(settings.addedPlatformIds) }
+
+    suspend fun runCrossAppSync() {
+        val connectedTargets = installedApps.filter {
+            it.mode == ConnectionMode.FULLY_CONNECTED && it.packageName != null
+        }
+        if (connectedTargets.isEmpty()) {
+            syncSummaryMsg = "No connected bridge apps found to sync."
+            return
+        }
+        syncingNow = true
+        syncProgress = 0f
+        syncCurrentLabel = "Scanning local games..."
+        val localGames = withContext(Dispatchers.IO) { luaInstaller.listInstalledLuaGames() }
+        val totalSteps = (localGames.size * connectedTargets.size).coerceAtLeast(1)
+        var done = 0
+        var okCount = 0
+        val depotCacheDir = File(settings.downloadFolder, "depotcache")
+        for (target in connectedTargets) {
+            val pkg = target.packageName!!
+            for (g in localGames) {
+                syncCurrentLabel = "Pushing ${g.name} to ${target.appName} (${done + 1}/$totalSteps)..."
+                val ok = withContext(Dispatchers.IO) {
+                    val luaFile = File(settings.downloadFolder, "stplug-in/${g.appId}.lua")
+                    val content = runCatching { luaFile.readText(Charsets.UTF_8) }.getOrDefault("")
+                    if (content.isNotBlank()) {
+                        val res = TargetAppBridge.pushLuaGame(
+                            context = context,
+                            pkg = pkg,
+                            appId = g.appId,
+                            name = g.name,
+                            luaContent = content,
+                            depotCacheDir = depotCacheDir
+                        )
+                        res.isSuccess
+                    } else {
+                        false
+                    }
+                }
+                if (ok) okCount++
+                done++
+                syncProgress = done.toFloat() / totalSteps.toFloat()
+            }
+        }
+        syncingNow = false
+        syncSummaryMsg = "Synced $okCount push(es) across ${connectedTargets.size} connected app(s)."
+    }
 
     Column(
         modifier = Modifier
@@ -1875,171 +2232,196 @@ fun MergedOptionsTab(
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("Platform, Bridge & SAF Folder", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        Text(
-            text = "Active: ${settings.selectedPlatform.displayName}" +
-                (targetStatus.packageName?.let { " ($it)" } ?: ""),
-            style = MaterialTheme.typography.bodySmall
-        )
-        if (safValidation != null) {
+        // 1. LuaTools Account Login (moved from Home)
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("LuaTools Account", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                if (signedIn) {
+                    Text(
+                        "Signed in as ${authService.displayName ?: authService.email ?: "LuaTools User"}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF81C784)
+                    )
+                    OutlinedButton(onClick = {
+                        authService.signOut()
+                        signedIn = false
+                        authStatusMsg = "Signed out"
+                    }) {
+                        Text("Sign Out")
+                    }
+                } else {
+                    Text(
+                        "Sign in to download manifests, .lua files, and game fixes.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Button(
+                        enabled = !authBusy,
+                        onClick = {
+                            scope.launch {
+                                authBusy = true
+                                val res = authService.signInWithDiscordPkceAsync()
+                                signedIn = authService.isSignedIn
+                                authStatusMsg = res.fold(
+                                    onSuccess = { "Signed in as $it" },
+                                    onFailure = { it.message ?: "Discord login failed" }
+                                )
+                                authBusy = false
+                            }
+                        }
+                    ) {
+                        Text("Discord Sign In")
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = botCode,
+                            onValueChange = { botCode = it },
+                            label = { Text("6-char /login Bot Code") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(
+                            enabled = botCode.trim().length >= 4 && !authBusy,
+                            onClick = {
+                                scope.launch {
+                                    authBusy = true
+                                    val res = authService.signInWithBotCodeAsync(botCode)
+                                    signedIn = authService.isSignedIn
+                                    authStatusMsg = res.fold(
+                                        onSuccess = { "Signed in as $it" },
+                                        onFailure = { it.message ?: "Code sign-in failed" }
+                                    )
+                                    authBusy = false
+                                }
+                            }
+                        ) {
+                            Text("Redeem")
+                        }
+                    }
+                }
+                if (authStatusMsg != null) {
+                    Text(authStatusMsg!!, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+
+        // 2. Platforms & Bridges (multi-platform management)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("Platforms & Bridges", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Button(onClick = {
+                addPlatformSelection = null
+                showAddPlatformDialog = true
+            }) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(Modifier.width(4.dp))
+                Text("Add")
+            }
+        }
+
+        if (installedApps.isEmpty()) {
             Text(
-                text = "SAF: ${safValidation.message}",
+                "No target emulator apps detected. Tap Add to see setup instructions.",
                 style = MaterialTheme.typography.bodySmall,
-                color = if (safValidation.isValid) Color(0xFF81C784) else Color(0xFFFFB74D)
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         } else {
-            Text(
-                text = "SAF Folder: Not linked",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onGrantSaf) {
-                Text(if (safUri == null) "Select SAF Folder" else "Change SAF Folder")
-            }
-            if (safUri != null) {
-                TextButton(onClick = onClearSaf) {
-                    Text("Clear")
-                }
-            }
-            OutlinedButton(onClick = onRefreshBridge) {
-                Text("Re-check Bridge")
-            }
-        }
-        OutlinedButton(onClick = onOpenSetup, modifier = Modifier.fillMaxWidth()) {
-            Text("Switch Platform / Re-run Setup")
-        }
-
-        if (targetStatus.mode == ConnectionMode.FULLY_CONNECTED && targetStatus.packageName != null) {
-            var steamEmuStatus by remember { mutableStateOf<String?>(null) }
-            var steamEmuBusy by remember { mutableStateOf(false) }
-            var autoCloseWine by remember { mutableStateOf(false) }
-
-            LaunchedEffect(targetStatus.packageName) {
-                TargetAppBridge.getBridgeStatus(context, targetStatus.packageName).onSuccess { jsonStr ->
-                    runCatching {
-                        val obj = org.json.JSONObject(jsonStr)
-                        autoCloseWine = obj.optBoolean("autoclose_wine", false)
-                    }
-                }
-            }
-
-            HorizontalDivider()
-            Text("Steam Unlocker (BST / OST)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            Text(
-                "Download BetterSteamTools or OST-Nightly from GitHub and push to ${targetStatus.appName} over the bridge.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    enabled = !steamEmuBusy,
-                    onClick = {
-                        scope.launch {
-                            steamEmuBusy = true
-                            steamEmuStatus = "Downloading & pushing BST..."
-                            val pkg = targetStatus.packageName
-                            val dl = SteamEmuDownloader.downloadPack(context, "bst")
-                            steamEmuStatus = dl.fold(
-                                onSuccess = { dir ->
-                                    val push = TargetAppBridge.pushSteamEmuPack(context, pkg, "bst", dir)
-                                    push.fold(
-                                        onSuccess = { n ->
-                                            val set = TargetAppBridge.setSteamEmu(context, pkg, "bst", realSteam = false)
-                                            set.fold(
-                                                onSuccess = { "BST pushed ($n DLLs) & enabled" },
-                                                onFailure = { "BST pushed, set_steam_emu failed: ${it.message}" }
-                                            )
-                                        },
-                                        onFailure = { "Push failed: ${it.message}" }
-                                    )
+            installedApps.forEach { app ->
+                val pkg = app.packageName ?: return@forEach
+                val isSelected = syncAllApps || pkg == targetStatus.packageName
+                val isConnected = app.mode == ConnectionMode.FULLY_CONNECTED
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isSelected && isConnected) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("${app.appName} ($pkg)", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                text = when {
+                                    syncAllApps && isConnected -> "Active (Synced v${app.bridgeVersion})"
+                                    isConnected -> "Connected v${app.bridgeVersion}"
+                                    else -> "Fallback"
                                 },
-                                onFailure = { "Download failed: ${it.message}" }
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isConnected) Color(0xFF81C784) else Color(0xFFFFB74D)
                             )
-                            steamEmuBusy = false
+                        }
+                        Text(app.detail, style = MaterialTheme.typography.bodySmall)
+                        if (pkg == targetStatus.packageName && safValidation != null) {
+                            Text(
+                                text = "SAF: ${safValidation.message}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (safValidation.isValid) Color(0xFF81C784) else Color(0xFFFFB74D)
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                enabled = !syncAllApps && pkg != targetStatus.packageName,
+                                onClick = { onSelectTarget(pkg) }
+                            ) {
+                                Text(if (syncAllApps) "Active (All)" else if (pkg == targetStatus.packageName) "Active" else "Set Active")
+                            }
+                            if (pkg == targetStatus.packageName || syncAllApps) {
+                                OutlinedButton(onClick = onGrantSaf) {
+                                    Text(if (safUri == null) "Link SAF" else "Change SAF")
+                                }
+                                if (pkg == targetStatus.packageName && safUri != null) {
+                                    TextButton(onClick = onClearSaf) { Text("Clear SAF") }
+                                }
+                            }
+                            OutlinedButton(onClick = onRefreshBridge) {
+                                Text("Check")
+                            }
                         }
                     }
-                ) { Text("Install BST") }
-
-                OutlinedButton(
-                    enabled = !steamEmuBusy,
-                    onClick = {
-                        scope.launch {
-                            steamEmuBusy = true
-                            steamEmuStatus = "Downloading & pushing OST..."
-                            val pkg = targetStatus.packageName
-                            val dl = SteamEmuDownloader.downloadPack(context, "ost")
-                            steamEmuStatus = dl.fold(
-                                onSuccess = { dir ->
-                                    val push = TargetAppBridge.pushSteamEmuPack(context, pkg, "ost", dir)
-                                    push.fold(
-                                        onSuccess = { n ->
-                                            val set = TargetAppBridge.setSteamEmu(context, pkg, "ost", realSteam = false)
-                                            set.fold(
-                                                onSuccess = { "OST pushed ($n DLLs) & enabled" },
-                                                onFailure = { "OST pushed, set_steam_emu failed: ${it.message}" }
-                                            )
-                                        },
-                                        onFailure = { "Push failed: ${it.message}" }
-                                    )
-                                },
-                                onFailure = { "Download failed: ${it.message}" }
-                            )
-                            steamEmuBusy = false
-                        }
-                    }
-                ) { Text("Install OST") }
-
-                OutlinedButton(
-                    enabled = !steamEmuBusy,
-                    onClick = {
-                        scope.launch {
-                            steamEmuBusy = true
-                            val res = TargetAppBridge.setSteamEmu(context, targetStatus.packageName, "off", realSteam = false)
-                            steamEmuStatus = res.fold(
-                                onSuccess = { "Steam unlocker set to OFF" },
-                                onFailure = { "Error: ${it.message}" }
-                            )
-                            steamEmuBusy = false
-                        }
-                    }
-                ) { Text("Off") }
-            }
-            steamEmuStatus?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("Auto-close Wine Container")
-                    Text(
-                        "Close container automatically when the game .exe exits",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
                 }
-                Switch(
-                    checked = autoCloseWine,
-                    onCheckedChange = { enabled ->
-                        autoCloseWine = enabled
-                        scope.launch {
-                            TargetAppBridge.setSteamEmu(
-                                context,
-                                targetStatus.packageName,
-                                autoCloseWine = enabled
-                            )
-                        }
-                    }
+            }
+        }
+
+        // Cross-app synchronization toggle
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Sync Games & Options Across Apps")
+                Text(
+                    "Keep games & settings synchronized across all connected apps",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+            Switch(
+                checked = syncAllApps,
+                onCheckedChange = { enabled ->
+                    if (enabled) {
+                        syncAllApps = true
+                        showSyncConfirmDialog = true
+                    } else {
+                        syncAllApps = false
+                        settings.syncAllConnectedApps = false
+                    }
+                }
+            )
+        }
+        syncSummaryMsg?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
         }
 
         HorizontalDivider()
 
+        // 3. LuaTools Options
         Text("LuaTools Options", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -2111,60 +2493,136 @@ fun MergedOptionsTab(
             }
         }
 
-        HorizontalDivider()
-
-        Text("CloudRedirect Options", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        Text(
-            text = if (nativeVer != null) "Native Core: v$nativeVer" else "Native Core: not loaded",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("Auto-Sync on Launch / Exit")
-                Text(
-                    "Runs automatically when BannerHub Bridge is connected",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Switch(
-                checked = autoSync,
-                onCheckedChange = {
-                    autoSync = it
-                    settings.autoSyncOnLaunch = it
-                }
-            )
-        }
-
-        OutlinedTextField(
-            value = cloudProvider,
-            onValueChange = {
-                cloudProvider = it
-                settings.cloudProvider = it
-            },
-            label = { Text("Cloud Provider (gdrive, onedrive, r2, s3, webdav, folder)") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        OutlinedTextField(
-            value = cloudAccountId,
-            onValueChange = {
-                cloudAccountId = it
-                settings.cloudAccountId = it
-            },
-            label = { Text("Steam Account ID") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-
         Spacer(Modifier.height(16.dp))
+    }
+
+    // Confirmation dialog for cross-app synchronization
+    if (showSyncConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showSyncConfirmDialog = false
+                syncAllApps = false
+                settings.syncAllConnectedApps = false
+            },
+            title = { Text("Synchronize Connected Apps") },
+            text = { Text("Start synchronization now?") },
+            confirmButton = {
+                Button(onClick = {
+                    showSyncConfirmDialog = false
+                    settings.syncAllConnectedApps = true
+                    scope.launch { runCrossAppSync() }
+                }) {
+                    Text("Yes")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showSyncConfirmDialog = false
+                    syncAllApps = false
+                    settings.syncAllConnectedApps = false
+                }) {
+                    Text("No")
+                }
+            }
+        )
+    }
+
+    // Loading progress dialog during cross-app sync
+    if (syncingNow) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Synchronizing Apps...") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(syncCurrentLabel, style = MaterialTheme.typography.bodySmall)
+                    LinearProgressIndicator(
+                        progress = { syncProgress.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {}
+        )
+    }
+
+    // Add Platform dialog with setup instructions
+    if (showAddPlatformDialog) {
+        AlertDialog(
+            onDismissRequest = { showAddPlatformDialog = false },
+            title = {
+                Text(addPlatformSelection?.let { "Setup ${it.displayName}" } ?: "Add Platform")
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (addPlatformSelection == null) {
+                        TargetPlatform.entries.forEach { plat ->
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        addPlatformSelection = plat
+                                        settings.addPlatform(plat.id)
+                                        addedPlatformIds = settings.addedPlatformIds
+                                    }
+                            ) {
+                                Column(Modifier.padding(12.dp)) {
+                                    Text(plat.displayName, fontWeight = FontWeight.SemiBold)
+                                    Text(plat.subtitle, style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                        }
+                    } else {
+                        val plat = addPlatformSelection!!
+                        val instructions = when (plat) {
+                            TargetPlatform.BANNERHUB ->
+                                "1. Install the modded BannerHub APK (with bh_lua_bridge).\n" +
+                                "2. Optionally link BannerHub's MTDataFilesProvider SAF folder for manual fallback.\n" +
+                                "3. Tap Check Bridge to verify connection."
+                            TargetPlatform.WINNATIVE ->
+                                "1. Install the modded GameNative APK (app.gamenative with LuaTools bridge).\n" +
+                                "2. Tap Check Bridge to detect app.gamenative.bh_lua_bridge.\n" +
+                                "3. Games pushed via LuaTools appear in GameNative automatically."
+                            else -> "${plat.displayName} support is coming soon."
+                        }
+                        Text(instructions, style = MaterialTheme.typography.bodySmall)
+                        if (plat == TargetPlatform.BANNERHUB) {
+                            OutlinedButton(onClick = {
+                                showAddPlatformDialog = false
+                                onGrantSaf()
+                            }) {
+                                Text("Link SAF Folder")
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                if (addPlatformSelection != null) {
+                    Button(onClick = {
+                        onRefreshBridge()
+                        showAddPlatformDialog = false
+                    }) {
+                        Text("Check Bridge")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    if (addPlatformSelection != null) {
+                        addPlatformSelection = null
+                    } else {
+                        showAddPlatformDialog = false
+                    }
+                }) {
+                    Text(if (addPlatformSelection != null) "Back" else "Close")
+                }
+            }
+        )
     }
 }
 
