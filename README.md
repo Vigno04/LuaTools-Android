@@ -2,8 +2,9 @@
 
 Android companion app for **LuaTools** — push `.lua` / `.manifest` games, apply online & community game fixes, manage BetterSteamTools / OpenSteamTools packs, and sync Steam Cloud saves via **CloudRedirect** (Google Drive) to Android Wine/Steam emulators (**BannerHub**, **GameNative**, **Winlator**, etc.).
 
-## Proof-of-Concept Integration
-- **[Modified BannerHub (Vigno04/bannerhub)](https://github.com/Vigno04/bannerhub)** — Proof-of-concept Android Steam/Wine emulator integrating the `luatools-javasteam-addon` library (`BhLuaBridgeProvider`, `BhLuaSteamEmu`, `BhLuaCloudHook`).
+## Integrated Emulators
+- **[Modified BannerHub (Vigno04/bannerhub)](https://github.com/Vigno04/bannerhub)** — Android Steam/Wine emulator integrating the `luatools-javasteam-addon` library (`BhLuaBridgeProvider`, `BhLuaSteamEmu`, `BhLuaCloudHook`).
+- **[Modified GameNative (Vigno04/GameNative)](https://github.com/Vigno04/GameNative)** — Open-source Android Steam/Wine emulator integrating `luatools-javasteam-addon` (`GameNativeLuaBridgeProvider`, `SteamService`, `GameDownloadService`) with automatic upstream release syncing.
 
 ## Repositories
 - `app/` — Android Jetpack Compose app (`com.luatools.companion`)
