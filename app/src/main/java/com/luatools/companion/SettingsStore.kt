@@ -11,6 +11,7 @@ enum class TargetPlatform(
     val supported: Boolean
 ) {
     BANNERHUB("bannerhub", "BannerHub", "GameHub 5.3.5 ReVanced (Bridge + SAF Fallback)", true),
+    BANNERHUB_V6("bannerhub_v6", "BannerHub v6", "GameHub 6.3.1 ReVanced (SteamCDN + CloudRedirect)", true),
     GAMEHUB("gamehub", "GameHub", "Coming soon", false),
     WINNATIVE("winnative", "GameNative", "JavaSteam Bridge + CloudRedirect", true),
     WINLATOR("winlator", "Winlator", "Coming soon", false)

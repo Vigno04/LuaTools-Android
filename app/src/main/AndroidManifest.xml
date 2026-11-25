@@ -9,6 +9,7 @@
 
     <!-- Required on Android 11+ to probe BannerHub and future target apps -->
     <queries>
+        <package android:name="banner.hub.v6" />
         <package android:name="banner.hub" />
         <package android:name="gamehub.lite" />
         <package android:name="com.tencent.ig" />

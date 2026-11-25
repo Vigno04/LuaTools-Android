@@ -121,7 +121,7 @@ fun LuaToolsAndroidRoot() {
     var selectedPlatform by remember { mutableStateOf(settings.selectedPlatform) }
     var installedBannerHubs by remember { mutableStateOf(TargetAppBridge.probeAllBannerHub(context)) }
     var targetStatus by remember {
-        mutableStateOf(TargetAppBridge.probeBannerHub(context, settings.selectedPackageName))
+        mutableStateOf(TargetAppBridge.probeBannerHub(context, settings.selectedPackageName, selectedPlatform))
     }
 
     val currentSafKey = targetStatus.packageName ?: selectedPlatform.id
@@ -136,7 +136,7 @@ fun LuaToolsAndroidRoot() {
 
     fun refreshTargetStatus() {
         installedBannerHubs = TargetAppBridge.probeAllBannerHub(context)
-        targetStatus = TargetAppBridge.probeBannerHub(context, settings.selectedPackageName)
+        targetStatus = TargetAppBridge.probeBannerHub(context, settings.selectedPackageName, selectedPlatform)
         val key = targetStatus.packageName ?: selectedPlatform.id
         safTreeUri = settings.getSafUri(key)
         safValidation = safTreeUri?.let {
@@ -213,10 +213,11 @@ fun LuaToolsAndroidRoot() {
             safValidation = safValidation,
             onSelectTarget = { pkg ->
                 settings.selectedPackageName = pkg
-                val plat = when (pkg) {
+                val matched = installedBannerHubs.firstOrNull { it.packageName == pkg }
+                val plat = matched?.platform ?: when (pkg) {
                     "app.gamenative" -> TargetPlatform.WINNATIVE
-                    "gamehub.lite" -> TargetPlatform.GAMEHUB
                     "com.winlator" -> TargetPlatform.WINLATOR
+                    "banner.hub.v6" -> TargetPlatform.BANNERHUB_V6
                     else -> TargetPlatform.BANNERHUB
                 }
                 selectedPlatform = plat
@@ -269,12 +270,12 @@ fun PlatformSelectScreen(
 
             if (installedBannerHubs.isNotEmpty()) {
                 installedBannerHubs.forEach { bh ->
-                    val isSelected = selected == TargetPlatform.BANNERHUB &&
+                    val isSelected = selected == bh.platform &&
                         (selectedPackage == null || selectedPackage == bh.packageName)
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onSelect(TargetPlatform.BANNERHUB, bh.packageName) },
+                            .clickable { onSelect(bh.platform, bh.packageName) },
                         colors = CardDefaults.cardColors(
                             containerColor = if (isSelected)
                                 MaterialTheme.colorScheme.primaryContainer
@@ -288,15 +289,15 @@ fun PlatformSelectScreen(
                         ) {
                             Column(Modifier.weight(1f)) {
                                 Text(
-                                    "BannerHub (${bh.packageName})",
+                                    "${bh.appName} (${bh.packageName})",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.SemiBold
                                 )
                                 Text(
                                     if (bh.mode == ConnectionMode.FULLY_CONNECTED)
-                                        "Bridge v${bh.bridgeVersion} detected (Auto Sync)"
+                                        "${bh.platform.displayName} • Bridge v${bh.bridgeVersion} detected (Auto Sync)"
                                     else
-                                        "Standard / Unmodified (SAF Manual Fallback)",
+                                        "${bh.platform.displayName} • Standard / Unmodified (SAF Manual Fallback)",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -307,8 +308,9 @@ fun PlatformSelectScreen(
                 }
             }
 
+            val detectedPlatforms = installedBannerHubs.map { it.platform }.toSet()
             TargetPlatform.entries.forEach { platform ->
-                if (platform == TargetPlatform.BANNERHUB && installedBannerHubs.isNotEmpty()) {
+                if (platform in detectedPlatforms) {
                     return@forEach
                 }
                 val isSelected = platform == selected
@@ -691,7 +693,7 @@ fun ConnectionStatusCard(
         ConnectionMode.FULLY_CONNECTED -> Triple(
             Color(0xFF1B3B2B),
             Icons.Default.CheckCircle,
-            "BannerHub Bridge Connected"
+            "${status.appName} Bridge Connected"
         )
         ConnectionMode.MANUAL_FALLBACK -> Triple(
             Color(0xFF3E2E14),
@@ -701,7 +703,7 @@ fun ConnectionStatusCard(
         ConnectionMode.NOT_INSTALLED -> Triple(
             Color(0xFF2B2B2B),
             Icons.Default.Warning,
-            "BannerHub Not Detected"
+            "${status.appName} Not Detected"
         )
     }
 
@@ -862,6 +864,26 @@ fun HomeTab(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
+                if (targetStatus.platform == TargetPlatform.BANNERHUB_V6 &&
+                    targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
+                    targetStatus.packageName != null
+                ) {
+                    OutlinedButton(onClick = {
+                        val pkg = targetStatus.packageName!!
+                        val openIntent = Intent("com.luatools.OPEN_LUATOOLS").apply {
+                            setPackage(pkg)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        runCatching { context.startActivity(openIntent) }.onFailure {
+                            context.packageManager.getLaunchIntentForPackage(pkg)?.let { launch ->
+                                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                context.startActivity(launch)
+                            }
+                        }
+                    }) {
+                        Text("Open LuaTools in ${targetStatus.appName}")
+                    }
+                }
                 if (visibleGames.isNotEmpty()) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
@@ -1013,7 +1035,11 @@ fun HomeTab(
                                                     )
                                                 }
                                                 libraryMsg = res.fold(
-                                                    onSuccess = { "Pushed ${game.name} from local cache (0 fetches): $it" },
+                                                    onSuccess = {
+                                                        settings.addAppSyncedId(targetStatus.packageName!!, id)
+                                                        refreshAppGames()
+                                                        "Pushed ${game.name} from local cache (0 fetches): $it"
+                                                    },
                                                     onFailure = { "Bridge push failed: ${it.message}" }
                                                 )
                                                 pushingAppId = null
@@ -1051,7 +1077,11 @@ fun HomeTab(
                                                         depotCacheDir = depotCacheDir
                                                     )
                                                     pushNote = pushRes.fold(
-                                                        onSuccess = { " → pushed to ${targetStatus.appName}" },
+                                                        onSuccess = {
+                                                            settings.addAppSyncedId(targetStatus.packageName, id)
+                                                            refreshAppGames()
+                                                            " → pushed to ${targetStatus.appName}"
+                                                        },
                                                         onFailure = { " (push error: ${it.message})" }
                                                     )
                                                 }
@@ -1072,6 +1102,56 @@ fun HomeTab(
                                 }
                             }
                         }
+                    }
+                }
+                val unpushedCached = allCachedGames.filter { !appInstalledIds.contains(it.appId) }
+                if (unpushedCached.isNotEmpty() &&
+                    targetStatus.mode == ConnectionMode.FULLY_CONNECTED &&
+                    targetStatus.packageName != null
+                ) {
+                    OutlinedButton(
+                        enabled = pushingAppId == null && !rePushAllBusy,
+                        onClick = {
+                            scope.launch {
+                                val pkg = targetStatus.packageName
+                                val total = unpushedCached.size
+                                var done = 0
+                                var okCount = 0
+                                rePushAllBusy = true
+                                rePushProgress = 0f
+                                val depotCacheDir = File(settings.downloadFolder, "depotcache")
+                                for (g in unpushedCached) {
+                                    pushingAppId = g.appId
+                                    rePushLabel = "Pushing ${g.name} to ${targetStatus.appName} (${done + 1}/$total)..."
+                                    val ok = withContext(Dispatchers.IO) {
+                                        val luaFile = File(settings.downloadFolder, "stplug-in/${g.appId}.lua")
+                                        val content = runCatching { luaFile.readText(Charsets.UTF_8) }.getOrDefault("")
+                                        if (content.isNotBlank()) {
+                                            TargetAppBridge.pushLuaGame(
+                                                context = context,
+                                                pkg = pkg,
+                                                appId = g.appId,
+                                                name = g.name,
+                                                luaContent = content,
+                                                depotCacheDir = depotCacheDir
+                                            ).isSuccess
+                                        } else false
+                                    }
+                                    if (ok) {
+                                        settings.addAppSyncedId(pkg, g.appId)
+                                        okCount++
+                                    }
+                                    done++
+                                    rePushProgress = done.toFloat() / total.toFloat()
+                                }
+                                pushingAppId = null
+                                rePushAllBusy = false
+                                refreshAppGames()
+                                libraryMsg = "Pushed $okCount/$total cached game(s) to ${targetStatus.appName}."
+                            }
+                        }
+                    ) {
+                        Text("Push Cached Games (${unpushedCached.size})")
                     }
                 }
                 Button(onClick = onGoToAdd) {
@@ -1167,7 +1247,12 @@ fun AddGamesTab(
                 luaContent = luaContent,
                 depotCacheDir = depotCacheDir
             )
-            if (res.isSuccess) okCount++ else lastError = res.exceptionOrNull()?.message
+            if (res.isSuccess) {
+                settings.addAppSyncedId(t.packageName!!, appId)
+                okCount++
+            } else {
+                lastError = res.exceptionOrNull()?.message
+            }
         }
         return if (okCount > 0) {
             val names = targets.joinToString { it.appName }
@@ -2212,6 +2297,7 @@ fun MergedOptionsTab(
                             luaContent = content,
                             depotCacheDir = depotCacheDir
                         )
+                        if (res.isSuccess) settings.addAppSyncedId(pkg, g.appId)
                         res.isSuccess
                     } else {
                         false
@@ -2580,8 +2666,12 @@ fun MergedOptionsTab(
                         val plat = addPlatformSelection!!
                         val instructions = when (plat) {
                             TargetPlatform.BANNERHUB ->
-                                "1. Install the modded BannerHub APK (with bh_lua_bridge).\n" +
+                                "1. Install BannerHub 3.x APK (GameHub 5.3.5 base with bh_lua_bridge).\n" +
                                 "2. Optionally link BannerHub's MTDataFilesProvider SAF folder for manual fallback.\n" +
+                                "3. Tap Check Bridge to verify connection."
+                            TargetPlatform.BANNERHUB_V6 ->
+                                "1. Install BannerHub v6 APK (GameHub 6.3.1 base, banner.hub.v6 with bh_lua_bridge).\n" +
+                                "2. Push games from LuaTools, then open Explore → LuaTools inside BannerHub v6 to download.\n" +
                                 "3. Tap Check Bridge to verify connection."
                             TargetPlatform.WINNATIVE ->
                                 "1. Install the modded GameNative APK (app.gamenative with LuaTools bridge).\n" +
@@ -2590,7 +2680,7 @@ fun MergedOptionsTab(
                             else -> "${plat.displayName} support is coming soon."
                         }
                         Text(instructions, style = MaterialTheme.typography.bodySmall)
-                        if (plat == TargetPlatform.BANNERHUB) {
+                        if (plat == TargetPlatform.BANNERHUB || plat == TargetPlatform.BANNERHUB_V6) {
                             OutlinedButton(onClick = {
                                 showAddPlatformDialog = false
                                 onGrantSaf()

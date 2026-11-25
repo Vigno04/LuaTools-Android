@@ -3,8 +3,10 @@ package com.luatools.companion.bridge
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.documentfile.provider.DocumentFile
+import com.luatools.companion.TargetPlatform
 
 enum class ConnectionMode {
     FULLY_CONNECTED,
@@ -16,6 +18,7 @@ data class TargetAppStatus(
     val appName: String,
     val packageName: String?,
     val mode: ConnectionMode,
+    val platform: TargetPlatform = TargetPlatform.BANNERHUB,
     val bridgeVersion: Int = 0,
     val mtAuthority: String? = null,
     val detail: String
@@ -35,6 +38,7 @@ data class SafValidationResult(
 object TargetAppBridge {
 
     private val bannerHubPackages = listOf(
+        "banner.hub.v6",
         "banner.hub",
         "gamehub.lite",
         "app.gamenative",
@@ -56,20 +60,54 @@ object TargetAppBridge {
             .map { probePackage(context, it) }
     }
 
-    fun probeBannerHub(context: Context, preferredPackage: String? = null): TargetAppStatus {
+    fun probeBannerHub(
+        context: Context,
+        preferredPackage: String? = null,
+        preferredPlatform: TargetPlatform? = null
+    ): TargetAppStatus {
         val all = probeAllBannerHub(context)
         if (all.isEmpty()) {
+            val plat = preferredPlatform ?: TargetPlatform.BANNERHUB
             return TargetAppStatus(
-                appName = "BannerHub",
+                appName = plat.displayName,
                 packageName = null,
                 mode = ConnectionMode.NOT_INSTALLED,
-                detail = "BannerHub not detected on this device"
+                platform = plat,
+                detail = "${plat.displayName} not detected on this device"
             )
         }
         if (!preferredPackage.isNullOrBlank()) {
             all.firstOrNull { it.packageName == preferredPackage }?.let { return it }
         }
+        if (preferredPlatform != null) {
+            all.firstOrNull { it.platform == preferredPlatform && it.mode == ConnectionMode.FULLY_CONNECTED }?.let { return it }
+            all.firstOrNull { it.platform == preferredPlatform }?.let { return it }
+        }
         return all.firstOrNull { it.mode == ConnectionMode.FULLY_CONNECTED } ?: all.first()
+    }
+
+    private fun isBannerHubV6Package(context: Context, pkg: String): Boolean {
+        if (pkg == "banner.hub.v6") return true
+        return try {
+            val info = context.packageManager.getPackageInfo(pkg, 0)
+            val vName = info.versionName.orEmpty()
+            val vCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) info.longVersionCode else @Suppress("DEPRECATION") info.versionCode.toLong()
+            val label = info.applicationInfo?.loadLabel(context.packageManager)?.toString().orEmpty()
+            vName.contains("6.3", ignoreCase = true) ||
+                vName.contains("631", ignoreCase = true) ||
+                vName.contains("V6", ignoreCase = true) ||
+                label.contains("v6", ignoreCase = true) ||
+                vCode >= 140L
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun inferFallbackPlatform(context: Context, pkg: String): TargetPlatform = when {
+        pkg == "app.gamenative" -> TargetPlatform.WINNATIVE
+        pkg == "com.winlator" -> TargetPlatform.WINLATOR
+        isBannerHubV6Package(context, pkg) -> TargetPlatform.BANNERHUB_V6
+        else -> TargetPlatform.BANNERHUB
     }
 
     private fun probePackage(context: Context, pkg: String): TargetAppStatus {
@@ -79,24 +117,36 @@ object TargetAppBridge {
             if (res != null && res.getBoolean("ok", false)) {
                 val version = res.getInt("bridge_version", 1)
                 val mtAuth = res.getString("mt_authority")
+                val platformId = res.getString("platform_id", "").orEmpty()
+                val platform = when {
+                    platformId == "bannerhub_v6" -> TargetPlatform.BANNERHUB_V6
+                    platformId == "gamenative" || pkg == "app.gamenative" -> TargetPlatform.WINNATIVE
+                    platformId == "winlator" || pkg == "com.winlator" -> TargetPlatform.WINLATOR
+                    isBannerHubV6Package(context, pkg) -> TargetPlatform.BANNERHUB_V6
+                    else -> TargetPlatform.BANNERHUB
+                }
+                val defaultName = platform.displayName
                 return TargetAppStatus(
-                    appName = res.getString("app_name", "BannerHub"),
+                    appName = res.getString("app_name", defaultName),
                     packageName = pkg,
                     mode = ConnectionMode.FULLY_CONNECTED,
+                    platform = platform,
                     bridgeVersion = version,
                     mtAuthority = mtAuth,
                     detail = "Bridge v$version connected ($pkg) — Auto Sync active"
                 )
             }
         } catch (_: Exception) {
-            // Unmodified BannerHub or provider not exported -> fall through to Manual Fallback
+            // Unmodified target or provider not exported -> fall through to Manual Fallback
         }
 
+        val fallbackPlatform = inferFallbackPlatform(context, pkg)
         val fallbackMtAuth = "$pkg.app.revanced.extension.gamehub.filemanager.MTDataFilesProvider"
         return TargetAppStatus(
-            appName = "BannerHub",
+            appName = fallbackPlatform.displayName,
             packageName = pkg,
             mode = ConnectionMode.MANUAL_FALLBACK,
+            platform = fallbackPlatform,
             mtAuthority = fallbackMtAuth,
             detail = "Bridge not present in $pkg — using Manual Fallback (SAF / MTDataFilesProvider)"
         )
